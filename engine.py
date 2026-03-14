@@ -7,6 +7,7 @@ Manages sessions, KV-cache storage, W_a computation, and latent rollout.
 This is the core engine — no HTTP/MCP dependencies. Can be used by:
   - The FastAPI server (server.py)
   - The MCP tool layer (mcp_server.py)
+  - The OpenAI-compatible proxy (openclaw_compat/openai_proxy.py)
   - Direct Python usage
 """
 
@@ -89,7 +90,7 @@ class LatentRelayEngine:
         print(f"[Engine] Ready.")
 
     def _compute_wa(self, lambda_reg: float = 1e-5) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute alignment matrix W_a = (W_out^T W_out + λI)^{-1} W_out^T W_in"""
+        """Compute alignment matrix W_a = (W_out^T W_out + lambda*I)^{-1} W_out^T W_in"""
         input_emb = self.model.get_input_embeddings().weight.detach().float().to(self.device)
         output_emb = self.model.get_output_embeddings().weight.detach().float().to(self.device)
 
@@ -110,9 +111,24 @@ class LatentRelayEngine:
 
     @staticmethod
     def _past_length(past_kv) -> int:
-        if not past_kv:
+        """Get sequence length from past_key_values.
+
+        Handles both DynamicCache (transformers >= 4.36) and legacy tuple format.
+        """
+        if past_kv is None:
             return 0
-        return past_kv[0][0].shape[-2]
+        # DynamicCache: access key_cache list directly
+        if hasattr(past_kv, 'key_cache'):
+            if len(past_kv.key_cache) > 0:
+                return past_kv.key_cache[0].shape[-2]
+            return 0
+        # DynamicCache alternative API
+        if hasattr(past_kv, 'get_seq_length'):
+            return past_kv.get_seq_length()
+        # Legacy tuple format: ((k, v), (k, v), ...)
+        if isinstance(past_kv, (list, tuple)) and len(past_kv) > 0:
+            return past_kv[0][0].shape[-2]
+        return 0
 
     # ──────────────────────────────────────────────
     # Public API
@@ -160,7 +176,7 @@ class LatentRelayEngine:
         Args:
             session_id: Active session ID
             prompt: Text prompt for the agent
-            n_steps: Number of latent rollout steps (0 = just encode, no latent thinking)
+            n_steps: Number of latent rollout steps (0 = just encode)
             role: Agent role label (planner, critic, refiner, etc.)
             inherit_from: List of thought handles to inherit KV-cache from
 
@@ -181,8 +197,6 @@ class LatentRelayEngine:
                 thought = session.thoughts.get(handle)
                 if thought and thought.kv_cache is not None:
                     past_kv = thought.kv_cache
-                    # For chaining: use the last inherited thought's cache
-                    # (sequential agent pattern)
 
         # Encode prompt
         encoded = self.tokenizer(
@@ -212,7 +226,7 @@ class LatentRelayEngine:
         past = outputs.past_key_values
         last_hidden = outputs.hidden_states[-1][:, -1, :]
 
-        # Latent rollout: h → W_a → forward → h'
+        # Latent rollout: h -> W_a -> forward -> h'
         for step in range(n_steps):
             latent_vec = self._apply_realignment(last_hidden)
             latent_embed = latent_vec.unsqueeze(1)  # [1, 1, d_h]
@@ -279,18 +293,8 @@ class LatentRelayEngine:
         """
         Combine latent thoughts and generate a text answer.
 
-        Uses the last handle's KV-cache as context prefix, then generates text.
-
-        Args:
-            session_id: Active session ID
-            handles: Ordered list of thought handles to use as context
-            final_prompt: Text prompt for the final generation
-            max_new_tokens: Max tokens to generate
-            temperature: Sampling temperature
-            top_p: Nucleus sampling threshold
-
-        Returns:
-            Dict with generated text and metadata
+        Re-encodes the final prompt without inherited KV-cache to avoid
+        position encoding misalignment issues with some models.
         """
         with self._lock:
             session = self._sessions.get(session_id)
@@ -299,46 +303,19 @@ class LatentRelayEngine:
 
         t0 = time.time()
 
-        # Get the accumulated KV-cache from the last thought in the chain
-        past_kv = None
-        for h in handles:
-            thought = session.thoughts.get(h)
-            if thought and thought.kv_cache is not None:
-                past_kv = thought.kv_cache
-
-        # Encode final prompt
+        # Encode final prompt and generate directly
         encoded = self.tokenizer(
             final_prompt, return_tensors="pt", add_special_tokens=True
         )
         input_ids = encoded["input_ids"].to(self.device)
-        attention_mask = encoded["attention_mask"].to(self.device)
-
-        if past_kv is not None:
-            past_len = self._past_length(past_kv)
-            if past_len > 0:
-                past_mask = torch.ones(
-                    (1, past_len), dtype=attention_mask.dtype, device=self.device
-                )
-                attention_mask = torch.cat([past_mask, attention_mask], dim=-1)
-
-        # Generate text
-        cache_position = None
-        if past_kv is not None:
-            past_len = self._past_length(past_kv)
-            cache_position = torch.arange(
-                past_len, past_len + input_ids.shape[-1],
-                dtype=torch.long, device=self.device,
-            )
 
         gen_outputs = self.model.generate(
             input_ids=input_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_kv,
-            cache_position=cache_position,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
             do_sample=True,
+            repetition_penalty=1.2,
             pad_token_id=self.tokenizer.pad_token_id,
         )
 
@@ -380,7 +357,6 @@ class LatentRelayEngine:
             session = self._sessions.pop(session_id, None)
         if session is None:
             return False
-        # Free KV-caches
         for thought in session.thoughts.values():
             thought.kv_cache = None
             thought.hidden_embedding = None
