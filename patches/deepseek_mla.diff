@@ -1,0 +1,75 @@
+diff --git a/methods/__pycache__/latent_mas.cpython-312.pyc b/methods/__pycache__/latent_mas.cpython-312.pyc
+new file mode 100644
+index 0000000..5f1cf26
+Binary files /dev/null and b/methods/__pycache__/latent_mas.cpython-312.pyc differ
+diff --git a/methods/latent_mas.py b/methods/latent_mas.py
+index 8036367..58825aa 100644
+--- a/methods/latent_mas.py
++++ b/methods/latent_mas.py
+@@ -354,15 +354,24 @@ class LatentMASMethod:
+                 # Get current prompt embedding
+                 curr_prompt_emb = self.model.embedding_layer(judger_encoded).squeeze(0).to(self.vllm_device)
+                 
+-                # assert Qwen model
+-                assert "Qwen" in self.args.model_name or "qwen" in self.args.model_name, "latent_embedding_position is only supported for Qwen models currently."
+-
+-                # handle latent embedding insertion position    
++                # handle latent embedding insertion position
++                # Supports: Qwen (<|im_start|>user), DeepSeek-V2 (User:),
++                #           DeepSeek-V3.2 (<｜User｜>), Llama ([INST])
+                 len_of_left = []
+                 for p in judger_prompts:
+-                    idx = p.find("<|im_start|>user\n")
+-                    # Get the text up to and including "<|im_start|>user\n"
+-                    left = p[: idx + len("<|im_start|>user\n")]
++                    insert_marker = None
++                    for marker in ["<|im_start|>user\n", "<｜User｜>", "User:", "[INST]"]:
++                        if marker in p:
++                            insert_marker = marker
++                            break
++                    if insert_marker is not None:
++                        idx = p.find(insert_marker)
++                        left = p[: idx + len(insert_marker)]
++                    else:
++                        # Fallback: insert after ~20% of tokens (past system/role header)
++                        all_ids = self.model.tokenizer(p)['input_ids']
++                        cut = max(1, len(all_ids) // 5)
++                        left = self.model.tokenizer.decode(all_ids[:cut])
+                     len_of_left.append(len(self.model.tokenizer(left)['input_ids']))
+                     
+                 B, L, H = curr_prompt_emb.shape
+diff --git a/models.py b/models.py
+index 1003da6..ad5aafc 100644
+--- a/models.py
++++ b/models.py
+@@ -50,13 +50,14 @@ class ModelWrapper:
+                 self.vllm_engine = LLM(model=model_name, tensor_parallel_size=tp_size, gpu_memory_utilization=gpu_util, enable_prefix_caching=True, enable_prompt_embeds=True)
+             else:
+                 self.vllm_engine = LLM(model=model_name, tensor_parallel_size=tp_size, gpu_memory_utilization=gpu_util)
+-            self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
++            self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
+             
+             use_second_hf = bool(getattr(args, "use_second_HF_model", False)) if args else False
+             if use_second_hf:
+                 self.HF_model = AutoModelForCausalLM.from_pretrained(
+                     model_name,
+                     torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
++                    trust_remote_code=True,
+                 ).to(args.device2).eval() 
+                 self.embedding_layer = self.HF_model.get_input_embeddings()
+                 self.HF_device = args.device2
+@@ -68,12 +69,13 @@ class ModelWrapper:
+             return  # skip loading transformers model
+ 
+         # fallback: normal transformers path
+-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
++        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
+         _ensure_pad_token(self.tokenizer)
+         with torch.no_grad():
+             self.model = AutoModelForCausalLM.from_pretrained(
+                 model_name,
+                 torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
++                trust_remote_code=True,
+             )
+         if len(self.tokenizer) != self.model.get_input_embeddings().weight.shape[0]:
+             self.model.resize_token_embeddings(len(self.tokenizer))
