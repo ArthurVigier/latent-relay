@@ -321,25 +321,17 @@ class LatentRelayEngine:
                 )
                 attention_mask = torch.cat([past_mask, attention_mask], dim=-1)
 
-        # Generate text
-        cache_position = None
-        if past_kv is not None:
-            past_len = self._past_length(past_kv)
-            cache_position = torch.arange(
-                past_len, past_len + input_ids.shape[-1],
-                dtype=torch.long, device=self.device,
-            )
 
+        # Generate text — let HF handle cache positions via attention_mask
         gen_outputs = self.model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            past_key_values=past_kv,
-            cache_position=cache_position,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
             do_sample=True,
             pad_token_id=self.tokenizer.pad_token_id,
+            repetition_penalty=1.2,
         )
 
         # Decode only the new tokens
