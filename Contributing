@@ -1,0 +1,62 @@
+# Contributing
+
+Thanks for considering contributing to Latent Relay. This is a small project that wraps someone else's research in a useful interface, so contributions that improve the wrapper without overcomplicating it are the most helpful.
+
+## What's useful
+
+**Bug fixes** — especially around model compatibility. The KV-cache handling differs across transformers versions and model architectures. If you find a model that breaks, a fix with a test case is ideal.
+
+**New model support** — patches for models that use non-standard KV-cache formats (like the existing DeepSeek MLA patch). Include a note on what VRAM you tested with and whether the latent rollout actually improves output quality for that model.
+
+**OpenClaw / OpenClaw-RL integration improvements** — the proxy works but is basic. Streaming could be chunked instead of single-shot, logprobs could be passed through for RL training, session persistence across requests would reduce model reload overhead.
+
+**Test coverage** — the test suite covers the happy path. Edge cases (empty prompts, very long contexts, concurrent sessions under load, CUDA OOM handling) are not tested.
+
+**Documentation fixes** — typos, unclear instructions, missing setup steps.
+
+## What's less useful
+
+- Rewriting the engine to use a different framework (vLLM, SGLang, TGI) without a clear reason. The HuggingFace `transformers` dependency is intentional — it keeps the code simple and matches LatentMAS upstream.
+- Adding features that belong in LatentMAS itself rather than in this wrapper. If you have ideas for the latent reasoning mechanism, consider contributing to [LatentMAS](https://github.com/Gen-Verse/LatentMAS) directly.
+- Large refactors without prior discussion. Open an issue first.
+
+## How to contribute
+
+1. Fork the repo
+2. Create a branch (`git checkout -b fix/dynamic-cache-edge-case`)
+3. Make your changes
+4. Test on at least one model (Qwen3-4B is the cheapest option, ~8GB VRAM)
+5. Open a PR with a clear description of what you changed and why
+
+## Running tests
+
+```bash
+# Unit tests (needs a GPU with the model downloaded)
+python test_e2e.py --model Qwen/Qwen3-4B --n_steps 60
+
+# OpenClaw compatibility tests (needs the proxy running on :30000)
+LATENT_MODEL=Qwen/Qwen3-4B python openclaw_compat/openai_proxy.py --port 30000 &
+sleep 30
+python openclaw_compat/test_01_openai_compat.py --port 30000
+python openclaw_compat/test_02_openclaw_config.py --port 30000
+python openclaw_compat/test_03_openclaw_rl_compat.py --port 30000
+
+# Phase 0 feasibility suite
+cd phase0 && python run_phase0.py --model Qwen/Qwen3-4B
+```
+
+## Code style
+
+No strict linter enforced. Just keep it consistent with the existing code: type hints where they help, docstrings on public methods, no unnecessary abstractions. The engine is ~300 lines and the proxy is ~200 lines — that's a feature, not a limitation.
+
+## Environment
+
+- Python 3.10+
+- PyTorch with CUDA
+- transformers (recent — the code handles both DynamicCache and legacy tuple KV formats)
+- FastAPI + uvicorn for the server/proxy
+- fastmcp for the MCP server
+
+## License
+
+By contributing, you agree that your contributions will be licensed under the MIT License.
