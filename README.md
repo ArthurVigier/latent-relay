@@ -255,6 +255,12 @@ pytest test_bridge.py -v
 # Base engine test (requires GPU + model)
 python test_e2e.py --model Qwen/Qwen3-4B
 
+# ERIS v5 smoke test (requires eris_server.py running)
+python eris_server.py --model Qwen/Qwen3-4B --port 8001 &
+sleep 60
+python patches/smoke_test_eris.py --port 8001 --n_steps 5
+# 25/25 passed (23/23 without ANTHROPIC_API_KEY)
+
 # OpenClaw compatibility tests (needs proxy running on :30000)
 LATENT_MODEL=Qwen/Qwen3-4B python openclaw_compat/openai_proxy.py --port 30000 &
 sleep 30
@@ -266,14 +272,28 @@ python openclaw_compat/test_03_openclaw_rl_compat.py --port 30000
 cd phase0 && python run_phase0.py --model Qwen/Qwen3-4B
 ```
 
+### Validation results (2026-03-22, Google Colab A100, Qwen3-4B)
+
+| Test suite | Result | Notes |
+|---|---|---|
+| `pytest test_bridge.py` | **68/68 passed** | No GPU required |
+| `test_e2e.py` Qwen3-4B | **PASS** (answer=18) | 30 steps, 337 positions |
+| `test_e2e.py` Qwen3.5-0.8B | Engine compatible | Answer FAIL expected (0.8B too small) |
+| ERIS smoke test | **25/25 passed** | Full Claude→Zombie→Claude pipeline |
+| ai-rsk scan | **PASS 99/100** | No BLOCK findings |
+
+**Engine improvements validated on GPU:**
+- Empirical W_a: MSE 15.69 → 0.25 (63×) vs static near-identity matrix
+- `collaborate()` passes accumulated KV-cache into `generate()` — latent context now influences final generation
+- Qwen3.5 hybrid GDN architecture supported (18 linear + 6 full attention layers)
+
 ## Security
 
 All code is tested with **[ai-rsk](https://github.com/Krigsexe/ai-rsk)** — a security gate for AI-generated code with three detection layers (static rules, Semgrep + Gitleaks + osv-scanner, project analysis).
 
 ```
 ai-rsk scan
-# Result:  — run ai-rsk scan to see current score
-
+# Result: PASS 99/100
 ```
 
 Enforced rules: no `pickle.load`, `weights_only=True` on all `torch.load` calls, no wildcard CORS, no hardcoded secrets, all dependencies pinned above known CVEs, 50 MB body limit on ERIS endpoints.
