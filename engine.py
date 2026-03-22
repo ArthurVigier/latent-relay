@@ -98,23 +98,85 @@ class LatentRelayEngine:
                   f"({_n_full} full attention, {len(_layer_types) - _n_full} linear)")
         _tied = getattr(_text_cfg, 'tie_word_embeddings', False)
         if _tied:
-            print("[Engine] Tied embeddings: W_a ≈ I (realignment = normalisation only)")
+            print("[Engine] Tied embeddings detected — empirical W_a will be used")
 
-        # Precompute W_a
+        # Precompute W_a (auto-detects degenerate static solution → empirical fallback)
         self._wa_matrix, self._target_norm = self._compute_wa()
-        print(f"[Engine] W_a computed: {self._wa_matrix.shape}")
+        print(f"[Engine] W_a ready: {list(self._wa_matrix.shape)}")
         print(f"[Engine] Ready.")
 
     def _compute_wa(self, lambda_reg: float = 1e-5) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute alignment matrix W_a = (W_out^T W_out + lambda*I)^{-1} W_out^T W_in"""
-        input_emb = self.model.get_input_embeddings().weight.detach().float().to(self.device)
+        """Compute alignment matrix W_a = (W_out^T W_out + lambda*I)^{-1} W_out^T W_in.
+
+        Falls back to empirical W_a when the static solution is near-identity
+        (happens when input/output embeddings are numerically identical even
+        without tie_word_embeddings=True, as observed on Qwen3 and Qwen3.5).
+        """
+        input_emb  = self.model.get_input_embeddings().weight.detach().float().to(self.device)
         output_emb = self.model.get_output_embeddings().weight.detach().float().to(self.device)
 
         gram = output_emb.T @ output_emb
         gram += lambda_reg * torch.eye(gram.shape[0], device=self.device, dtype=gram.dtype)
-        rhs = output_emb.T @ input_emb
-        wa = torch.linalg.solve(gram, rhs)
+        rhs  = output_emb.T @ input_emb
+        wa   = torch.linalg.solve(gram, rhs)
+
+        # Detect degenerate W_a — near-identity means the static projection
+        # carries no information.  Switch to an empirical estimate learned from
+        # actual (h_t, e_{t+1}) pairs so the realignment is genuinely useful.
+        I    = torch.eye(wa.shape[0], device=self.device, dtype=wa.dtype)
+        diff = (wa - I).norm().item()
+        if diff < 0.5:
+            print(f"[Engine] W_a static ≈ I (‖W_a−I‖={diff:.4f}) — computing empirical W_a")
+            return self._compute_wa_empirical(lambda_reg=lambda_reg)
+
         target_norm = input_emb.norm(dim=1).mean()
+        return wa, target_norm
+
+    def _compute_wa_empirical(
+        self, n_samples: int = 256, lambda_reg: float = 1e-4
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Learn W_a from real forward passes: W_a ≈ argmin ‖H W − E‖²
+
+        H[i] = last hidden state at token position t
+        E[i] = input embedding of token at position t+1
+
+        This captures the true hidden→embedding projection even when the
+        static embedding matrices are numerically identical (Qwen3, Qwen3.5).
+        """
+        import random
+
+        emb        = self.model.get_input_embeddings().weight.detach().float().to(self.device)
+        vocab_size = emb.shape[0]
+        seq_len    = 9                              # 9 tokens → 8 (h_t, e_{t+1}) pairs
+        n_seqs     = max(1, n_samples // (seq_len - 1))
+
+        print(f"[Engine] Sampling {n_seqs} sequences for empirical W_a...")
+
+        H_list, E_list = [], []
+        for _ in range(n_seqs):
+            token_ids = [random.randint(0, vocab_size - 1) for _ in range(seq_len)]
+            ids       = torch.tensor([token_ids], device=self.device)
+
+            with torch.no_grad():
+                out = self.model(ids, output_hidden_states=True, use_cache=False)
+
+            hs = out.hidden_states[-1][0].float()   # [seq_len, hidden_dim]
+            for t in range(seq_len - 1):
+                H_list.append(hs[t])
+                E_list.append(emb[token_ids[t + 1]])
+
+        H = torch.stack(H_list)  # [N, hidden_dim]
+        E = torch.stack(E_list)  # [N, hidden_dim]
+
+        gram = H.T @ H + lambda_reg * torch.eye(H.shape[1], device=self.device, dtype=H.dtype)
+        rhs  = H.T @ E
+        wa   = torch.linalg.solve(gram, rhs)
+
+        I    = torch.eye(wa.shape[0], device=self.device, dtype=wa.dtype)
+        diff = (wa - I).norm().item()
+        print(f"[Engine] Empirical W_a ready: shape={list(wa.shape)}, ‖W_a−I‖={diff:.4f}")
+
+        target_norm = E.norm(dim=1).mean()
         return wa, target_norm
 
     def _apply_realignment(self, hidden: torch.Tensor) -> torch.Tensor:
