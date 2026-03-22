@@ -26,6 +26,9 @@ httpx>=0.27.0
 # ERIS v5 — Claude client (eris_client.py / ClaudeZombieBridge)
 anthropic>=0.40.0
 
+# Testing
+pytest>=8.0.0
+
 # ERIS v5 — optional lazy-loaded analyzers
 # sae-lens>=5.0.0       # SAEs pré-entraînées (pip install sae-lens)
 # a-hat-optimizer       # Sonde Â-hat (install depuis le repo Arthur)
