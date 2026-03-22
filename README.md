@@ -267,7 +267,8 @@ All code is validated with **[ai-rsk](https://github.com/Krigsexe/ai-rsk)** — 
 
 ```
 ai-rsk scan
-# Result: PASS (0B 0W 1A) — Security Score: 99/100
+# Result: PASS — run ai-rsk scan to see current score
+
 ```
 
 Enforced rules: no `pickle.load`, `weights_only=True` on all `torch.load` calls, no wildcard CORS, no hardcoded secrets, all dependencies pinned above known CVEs, 50 MB body limit on ERIS endpoints.
