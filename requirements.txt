@@ -26,6 +26,9 @@ httpx>=0.27.0
 # ERIS v5 — Claude client (eris_client.py / ClaudeZombieBridge)
 anthropic>=0.40.0
 
+# Evaluation (eval/eval_phase1.py)
+datasets>=2.20.0
+
 # Testing
 pytest>=8.0.0
 
