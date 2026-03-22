@@ -31,7 +31,14 @@ def check(name, ok, detail=""):
 
 def post(path, body):
     r = requests.post(f"{BASE}{path}", json=body, timeout=120)
-    r.raise_for_status()
+    if not r.ok:
+        try:
+            detail = r.json().get("detail", r.text[:300])
+        except Exception:
+            detail = r.text[:300]
+        raise requests.HTTPError(
+            f"HTTP {r.status_code} {path}: {detail}", response=r
+        )
     return r.json()
 
 def get(path):
@@ -226,7 +233,7 @@ else:
 # ── Summary ───────────────────────────────────────────────────────────────────
 print("\n" + "=" * 60)
 total  = len(results)
-passed = sum(results.values())
+passed = sum(1 for v in results.values() if v)
 failed = total - passed
 print(f"Result: {passed}/{total} passed" +
       (f"  ({failed} FAILED)" if failed else "  — all OK"))
