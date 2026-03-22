@@ -616,6 +616,11 @@ class AnalyzerRegistry:
         """
         result: Dict = {}
 
+        # Normalise to 2-D — bridge passes [hidden_dim] (last token only),
+        # encode passes [seq_len, hidden_dim].  All analyzers expect 2-D.
+        if hidden.dim() == 1:
+            hidden = hidden.unsqueeze(0)  # [1, hidden_dim]
+
         # GPU-bound analyses: upload once, run, then explicitly free.
         needs_gpu = any(n in analyses for n in ("sae_features", "a_hat"))
         hidden_gpu: Optional[torch.Tensor] = None
