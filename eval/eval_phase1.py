@@ -161,11 +161,14 @@ class ERISEvalClient:
         return self._session_id
 
     def encode(self, text: str, return_layers: list = None):
-        """Encode text and get hidden states."""
-        sid = self._ensure_session()
+        """Encode text and get hidden states.
+
+        Does NOT pass session_id — encode works statelessly and avoids
+        session-not-found 404s that occur when the server restarts or
+        runs with multiple workers (observed on Qwen3.5).
+        """
         payload = {
             "text": text,
-            "session_id": sid,
             "return_layers": return_layers or [-1],
             "compact": True,
         }
