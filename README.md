@@ -267,7 +267,7 @@ All code is tested with **[ai-rsk](https://github.com/Krigsexe/ai-rsk)** — a s
 
 ```
 ai-rsk scan
-# Result: PASS — run ai-rsk scan to see current score
+# Result:  — run ai-rsk scan to see current score
 
 ```
 
