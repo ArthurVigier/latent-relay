@@ -73,7 +73,12 @@ class ERISEvalClient:
             "compact": True,
         }
         r = self.client.post(f"{self.base_url}/v1/encode", json=payload)
-        r.raise_for_status()
+        if not r.is_success:
+            try:
+                detail = r.json().get("detail", r.text[:300])
+            except Exception:
+                detail = r.text[:300]
+            raise Exception(f"HTTP {r.status_code}: {detail}")
         return r.json()
 
     def health(self):
@@ -351,6 +356,24 @@ def main():
     # ── Preflight: verify ERIS endpoints are available ──
     client.preflight()
 
+    # ── Probe: detect actual number of hidden states returned by this model ──
+    log.info("Probing hidden state structure (single sentence, layer=-1)...")
+    try:
+        probe = client.encode("Hello world", return_layers=[-1])
+        log.info(f"  Probe OK: hidden_dim={probe.get('hidden_dim')}, "
+                 f"keys={list(probe.get('hidden_states', {}).keys())}")
+    except Exception as e:
+        log.error(f"  Probe FAILED: {e}")
+        log.error(
+            "  Cannot encode even with layer=-1. Possible causes:\n"
+            "  1. Session not found — engine initialised in a different process worker\n"
+            "  2. output_hidden_states=True fails for this model\n"
+            "  3. Server raised a ValueError during the encode call\n"
+            "  Check eris_server.py stderr for the full traceback."
+        )
+        client.close()
+        sys.exit(1)
+
     # ── Detect model config ──
     try:
         health = client.health()
@@ -404,9 +427,19 @@ def main():
             int(n_layers * 0.25),           # 25%
         ]))
 
-    # Clamp to valid range
-    test_layers = [l for l in test_layers if 0 <= l < n_layers or l == -1]
-    test_layers = sorted(set(test_layers))
+    # Probe max valid layer index by trying encode with each layer individually.
+    # For hybrid models (Qwen3.5 GDN), output_hidden_states may return fewer
+    # layers than expected — discover the actual count before bulk encoding.
+    log.info("Probing valid layer indices...")
+    valid_layers = [-1]  # -1 always works (maps to last available)
+    for candidate in [l for l in test_layers if l != -1]:
+        try:
+            client.encode("test", return_layers=[candidate])
+            valid_layers.append(candidate)
+        except Exception as e:
+            log.warning(f"  Layer {candidate} rejected by server: {e}")
+    test_layers = sorted(set(valid_layers))
+    log.info(f"  Valid layers after probe: {test_layers}")
 
     log.info(f"Testing {len(test_layers)} layers: {test_layers}")
     log.info(f"Testing {len(POOLING)} pooling methods: {list(POOLING.keys())}")

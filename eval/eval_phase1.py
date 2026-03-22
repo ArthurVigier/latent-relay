@@ -4,37 +4,35 @@ ERIS v5 — Phase 1 Evaluation: Does the latent channel add information?
 =======================================================================
 
 Uses HuggingFace datasets (no hardcoded data):
-  - M4 (projection fidelity):  sentence-transformers/stsb  (1500+ annotated sentence pairs)
-  - M1-M3 (A/B/C comparison):  openai/gsm8k + TIGER-Lab/MMLU-Pro (technical questions)
+  - M4 (projection fidelity):  sentence-transformers/stsb
+  - M1-M3 (A/B/C comparison):  TIGER-Lab/MMLU-Pro + openai/gsm8k
   - M5 (LatentMAS gain):       same questions, varying K
   - M6 (implicit features):    SAE analysis on encoded hidden states
 
-Requirements:
-  pip install datasets anthropic httpx sentence-transformers scipy numpy tqdm
+Validated config (from M4 diagnostic v3 on Qwen3.5-4B):
+  - layer_9 / last_token / centered → Spearman=0.6538
+  - Single-layer-per-call encoding (avoids max_payload_bytes limit)
 
 Usage:
-  # 1. Start the ERIS server
-  python eris_server.py --model Qwen/Qwen3-14B --port 8001
+  python eris_server.py --model Qwen/Qwen3.5-4B --port 8001
 
-  # 2. Run evaluation (M4 only — no Claude API needed)
+  # M4 only (no Claude API needed, ~7 min)
   python eval/eval_phase1.py --eris-url http://localhost:8001 --metric m4
 
-  # 3. Run full evaluation (needs ANTHROPIC_API_KEY)
-  ANTHROPIC_API_KEY=sk-... python eval/eval_phase1.py --eris-url http://localhost:8001 --metric all
+  # M4 + M5 (no Claude API, ~15 min)
+  python eval/eval_phase1.py --eris-url http://localhost:8001 --metric m4 m5
 
-  # 4. Run with Qwen3.5
-  python eval/eval_phase1.py --eris-url http://localhost:8001 --metric m4 --tag qwen35-4b
+  # Full eval (needs ANTHROPIC_API_KEY, ~$5-8)
+  ANTHROPIC_API_KEY=sk-... python eval/eval_phase1.py --eris-url http://localhost:8001 --metric all
 """
 
 import os
-import sys
 import json
 import time
 import argparse
 import logging
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
-from typing import Optional
 
 import numpy as np
 from scipy import stats
@@ -45,190 +43,215 @@ log = logging.getLogger("eval_phase1")
 
 
 # ═══════════════════════════════════════════════════════════════
-# Data loading — all from HuggingFace, no hardcoded samples
+# Config — baked from M4 diagnostic v3 results
 # ═══════════════════════════════════════════════════════════════
 
-def load_stsb_pairs(n_pairs: int = 200, split: str = "test"):
-    """Load sentence pairs with similarity scores from STS Benchmark.
+MODEL_CONFIGS = {
+    "default": {
+        "m4_layer": 9,
+        "m4_pooling": "last_token",
+        "m4_centered": True,
+        "m4_threshold": 0.6,
+    },
+    "qwen3.5": {
+        "m4_layer": 9,         # 25% depth — full-attention layer in GDN hybrid
+        "m4_pooling": "last_token",
+        "m4_centered": True,
+        "m4_threshold": 0.6,
+    },
+    "qwen3": {
+        "m4_layer": 35,        # last layer
+        "m4_pooling": "last_token",
+        "m4_centered": True,
+        "m4_threshold": 0.6,
+    },
+}
 
-    Dataset: sentence-transformers/stsb
-    Each row: {sentence1, sentence2, score} where score ∈ [0, 1].
-    """
+def get_model_config(model_name: str) -> dict:
+    model_lower = str(model_name).lower()
+    if "3.5" in model_lower or "qwen3.5" in model_lower:
+        return MODEL_CONFIGS["qwen3.5"]
+    elif "qwen3" in model_lower:
+        return MODEL_CONFIGS["qwen3"]
+    return MODEL_CONFIGS["default"]
+
+
+# ═══════════════════════════════════════════════════════════════
+# ERIS client — single-layer-per-call, no session_id
+# ═══════════════════════════════════════════════════════════════
+
+import base64
+
+class ERISClient:
+    def __init__(self, base_url: str, timeout: float = 120.0):
+        import httpx
+        self.base_url = base_url.rstrip("/")
+        self.client = httpx.Client(timeout=timeout)
+        self._model = None
+
+    def health(self) -> dict:
+        r = self.client.get(f"{self.base_url}/health")
+        r.raise_for_status()
+        data = r.json()
+        self._model = data.get("model", "unknown")
+        return data
+
+    @property
+    def model_name(self):
+        if self._model is None:
+            self.health()
+        return self._model
+
+    def encode(self, text: str, layer: int = -1) -> dict:
+        r = self.client.post(
+            f"{self.base_url}/v1/encode",
+            json={"text": text, "return_layers": [layer], "compact": True},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def think(self, prompt: str, n_steps: int = 60) -> dict:
+        r = self.client.post(f"{self.base_url}/sessions")
+        r.raise_for_status()
+        sid = r.json()["session_id"]
+        try:
+            r = self.client.post(
+                f"{self.base_url}/think",
+                json={"session_id": sid, "prompt": prompt, "n_steps": n_steps},
+            )
+            r.raise_for_status()
+            return r.json()
+        finally:
+            try:
+                self.client.delete(f"{self.base_url}/sessions/{sid}")
+            except Exception:
+                pass
+
+    def latent_think(self, prompt: str, n_steps: int = 60) -> dict:
+        r = self.client.post(
+            f"{self.base_url}/v1/latent_think",
+            json={"prompt": prompt, "n_steps": n_steps, "return_trajectory": False},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def bridge(self, text: str, mode: str = "ruminate",
+               n_steps: int = 60, analyses: list = None) -> dict:
+        r = self.client.post(
+            f"{self.base_url}/v1/bridge",
+            json={
+                "claude_text": text, "mode": mode, "n_steps": n_steps,
+                "analyses": analyses or [],
+                "decode_after": True, "max_new_tokens": 512,
+            },
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def close(self):
+        self.client.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════
+
+def decode_b64(b64_str: str) -> np.ndarray:
+    return np.frombuffer(base64.b64decode(b64_str), dtype=np.float32)
+
+def extract_vector(enc: dict, hidden_dim: int) -> np.ndarray:
+    for key, val in enc.get("hidden_states", {}).items():
+        if isinstance(val, str):
+            return decode_b64(val).reshape(-1, hidden_dim)
+        elif isinstance(val, list):
+            mat = np.array(val, dtype=np.float32)
+            return mat if mat.ndim == 2 else mat.reshape(1, -1)
+    return None
+
+def pool(mat: np.ndarray, method: str) -> np.ndarray:
+    if method == "last_token":
+        return mat[-1]
+    elif method == "2nd_to_last":
+        return mat[-2] if mat.shape[0] >= 2 else mat[-1]
+    elif method == "mean_all":
+        return mat.mean(axis=0)
+    elif method == "mean_no_edges":
+        return mat[1:-1].mean(axis=0) if mat.shape[0] > 2 else mat.mean(axis=0)
+    elif method == "max_pool":
+        return mat.max(axis=0)
+    return mat.mean(axis=0)
+
+def cosine(v1, v2):
+    n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+    if n1 < 1e-10 or n2 < 1e-10:
+        return 0.0
+    return float(np.dot(v1, v2) / (n1 * n2))
+
+
+# ═══════════════════════════════════════════════════════════════
+# Data loading
+# ═══════════════════════════════════════════════════════════════
+
+def load_stsb_pairs(n_pairs: int = 200, seed: int = 42):
     from datasets import load_dataset
-
-    log.info(f"Loading STS-B ({split}, {n_pairs} pairs)...")
-    ds = load_dataset("sentence-transformers/stsb", split=split)
-
-    # Stratified sample: equal representation across similarity bins
+    np.random.seed(seed)
+    log.info(f"Loading STS-B test ({n_pairs} pairs)...")
+    ds = load_dataset("sentence-transformers/stsb", split="test")
     bins = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.01)]
     per_bin = n_pairs // len(bins)
     pairs = []
-
     for lo, hi in bins:
-        bin_items = [r for r in ds if lo <= r["score"] < hi]
-        np.random.shuffle(bin_items)
-        pairs.extend(bin_items[:per_bin])
-
-    # Fill remaining with random samples
+        items = [r for r in ds if lo <= r["score"] < hi]
+        np.random.shuffle(items)
+        pairs.extend(items[:per_bin])
     remaining = n_pairs - len(pairs)
     if remaining > 0:
-        all_indices = list(range(len(ds)))
-        np.random.shuffle(all_indices)
-        for idx in all_indices:
-            if len(pairs) >= n_pairs:
-                break
-            pairs.append(ds[idx])
-
-    log.info(f"  Loaded {len(pairs)} pairs across {len(bins)} similarity bins")
-    return pairs
+        all_items = list(ds)
+        np.random.shuffle(all_items)
+        pairs.extend(all_items[:remaining])
+    log.info(f"  {len(pairs[:n_pairs])} pairs")
+    return pairs[:n_pairs]
 
 
-def load_technical_questions(n_questions: int = 50):
-    """Load technical questions from MMLU-Pro (STEM/CS subset) + GSM8K.
-
-    Datasets:
-      - TIGER-Lab/MMLU-Pro: multi-choice STEM questions (we use computer_science, engineering)
-      - openai/gsm8k: grade school math (reasoning-heavy, good for latent rollout testing)
-    """
+def load_technical_questions(n_questions: int = 50, seed: int = 42):
     from datasets import load_dataset
-
+    np.random.seed(seed)
     questions = []
 
-    # MMLU-Pro CS/Engineering questions
-    log.info("Loading MMLU-Pro (CS + Engineering)...")
+    log.info("Loading MMLU-Pro (STEM)...")
     try:
         mmlu = load_dataset("TIGER-Lab/MMLU-Pro", split="test", trust_remote_code=True)
         cs_qs = [r for r in mmlu if r.get("category") in
                  ("computer_science", "engineering", "math", "physics")]
         np.random.shuffle(cs_qs)
-
         for r in cs_qs[:n_questions // 2]:
-            # Format as open question (strip multiple choice)
-            q = r["question"]
             questions.append({
-                "id": f"mmlu_{len(questions)}",
-                "text": q,
-                "source": "MMLU-Pro",
-                "category": r.get("category", "unknown"),
-                "answer": r.get("answer", None),
+                "id": f"mmlu_{len(questions)}", "text": r["question"],
+                "source": "MMLU-Pro", "category": r.get("category", "unknown"),
+                "answer": r.get("answer"),
             })
     except Exception as e:
-        log.warning(f"  MMLU-Pro load failed: {e}. Falling back to GSM8K only.")
+        log.warning(f"  MMLU-Pro failed: {e}")
 
-    # GSM8K questions
     remaining = n_questions - len(questions)
     if remaining > 0:
-        log.info(f"Loading GSM8K ({remaining} questions)...")
+        log.info(f"Loading GSM8K ({remaining})...")
         try:
             gsm = load_dataset("openai/gsm8k", "main", split="test")
             indices = list(range(len(gsm)))
             np.random.shuffle(indices)
-
             for idx in indices[:remaining]:
                 r = gsm[idx]
                 questions.append({
-                    "id": f"gsm_{len(questions)}",
-                    "text": r["question"],
-                    "source": "GSM8K",
-                    "category": "math_reasoning",
-                    "answer": r.get("answer", None),
+                    "id": f"gsm_{len(questions)}", "text": r["question"],
+                    "source": "GSM8K", "category": "math_reasoning",
+                    "answer": r.get("answer"),
                 })
         except Exception as e:
-            log.warning(f"  GSM8K load failed: {e}")
+            log.warning(f"  GSM8K failed: {e}")
 
-    log.info(f"  Loaded {len(questions)} technical questions")
+    log.info(f"  {len(questions)} questions")
     return questions
-
-
-# ═══════════════════════════════════════════════════════════════
-# ERIS client helpers
-# ═══════════════════════════════════════════════════════════════
-
-class ERISEvalClient:
-    """Lightweight client for evaluation — uses httpx directly."""
-
-    def __init__(self, base_url: str, timeout: float = 120.0):
-        import httpx
-        self.base_url = base_url.rstrip("/")
-        self.client = httpx.Client(timeout=timeout)
-        self._session_id = None
-
-    def _ensure_session(self):
-        if self._session_id is None:
-            r = self.client.post(f"{self.base_url}/sessions")
-            r.raise_for_status()
-            self._session_id = r.json()["session_id"]
-        return self._session_id
-
-    def encode(self, text: str, return_layers: list = None):
-        """Encode text and get hidden states.
-
-        Does NOT pass session_id — encode works statelessly and avoids
-        session-not-found 404s that occur when the server restarts or
-        runs with multiple workers (observed on Qwen3.5).
-        """
-        payload = {
-            "text": text,
-            "return_layers": return_layers or [-1],
-            "compact": True,
-        }
-        r = self.client.post(f"{self.base_url}/v1/encode", json=payload)
-        r.raise_for_status()
-        return r.json()
-
-    def latent_think(self, text: str, n_steps: int = 60,
-                     return_trajectory: bool = False):
-        """Run latent rollout."""
-        sid = self._ensure_session()
-        payload = {
-            "session_id": sid,
-            "prompt": text,
-            "n_steps": n_steps,
-            "return_trajectory": return_trajectory,
-            "trajectory_analyses": [],
-        }
-        r = self.client.post(f"{self.base_url}/v1/latent_think", json=payload)
-        r.raise_for_status()
-        return r.json()
-
-    def bridge(self, text: str, mode: str = "ruminate", n_steps: int = 60,
-               analyses: list = None):
-        """Full bridge pipeline."""
-        payload = {
-            "claude_text": text,
-            "mode": mode,
-            "n_steps": n_steps,
-            "analyses": analyses or [],
-            "decode_after": True,
-            "max_new_tokens": 512,
-        }
-        r = self.client.post(f"{self.base_url}/v1/bridge", json=payload)
-        r.raise_for_status()
-        return r.json()
-
-    def analyze(self, handle: str, analyses: list):
-        """Run MI analyses on a stored handle."""
-        sid = self._ensure_session()
-        payload = {"handle": handle, "session_id": sid, "analyses": analyses}
-        r = self.client.post(f"{self.base_url}/v1/analyze", json=payload)
-        r.raise_for_status()
-        return r.json()
-
-    def close(self):
-        if self._session_id:
-            try:
-                self.client.delete(
-                    f"{self.base_url}/sessions/{self._session_id}")
-            except Exception:
-                pass
-        self.client.close()
-
-
-def decode_b64_hidden(b64_str: str) -> np.ndarray:
-    """Decode base64 float32 hidden states."""
-    import base64
-    raw = base64.b64decode(b64_str)
-    return np.frombuffer(raw, dtype=np.float32)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -243,104 +266,80 @@ class M4Result:
     pearson_p: float
     n_pairs: int
     mean_cosine: float
-    pass_threshold: bool  # Spearman > 0.6
+    std_cosine: float
+    pass_threshold: bool
+    layer: int
+    pooling: str
+    centered: bool
 
     def summary(self) -> str:
-        status = "✅ PASS" if self.pass_threshold else "❌ FAIL"
+        s = "✅ PASS" if self.pass_threshold else "❌ FAIL"
         return (
             f"M4 Projection Fidelity ({self.n_pairs} pairs)\n"
-            f"  Spearman ρ = {self.spearman_r:.4f} (p={self.spearman_p:.2e}) {status}\n"
+            f"  Config: layer={self.layer}, pooling={self.pooling}, "
+            f"centered={self.centered}\n"
+            f"  Spearman ρ = {self.spearman_r:.4f} (p={self.spearman_p:.2e}) {s}\n"
             f"  Pearson  r = {self.pearson_r:.4f} (p={self.pearson_p:.2e})\n"
-            f"  Mean cosine similarity = {self.mean_cosine:.4f}\n"
-            f"  Threshold: Spearman > 0.6"
+            f"  Cosine: mean={self.mean_cosine:.4f}, std={self.std_cosine:.4f}"
         )
 
 
-def eval_m4(client: ERISEvalClient, n_pairs: int = 200) -> M4Result:
-    """M4: Does the zombie's latent space preserve semantic similarity?
-
-    For each STS-B pair (sentence1, sentence2, human_score):
-      1. Encode both sentences via zombie
-      2. Compute cosine similarity in zombie's hidden space
-      3. Correlate zombie cosine similarity with human similarity score
-
-    If Spearman > 0.6, the projection is faithful enough for the channel.
-    """
+def eval_m4(client: ERISClient, cfg: dict, n_pairs: int = 200) -> M4Result:
     pairs = load_stsb_pairs(n_pairs)
+    layer, pooling_name, centered = cfg["m4_layer"], cfg["m4_pooling"], cfg["m4_centered"]
+    unique = list({p["sentence1"] for p in pairs} | {p["sentence2"] for p in pairs})
 
-    human_scores = []
-    zombie_cosines = []
+    log.info(f"Encoding {len(unique)} sentences at layer {layer}...")
+    vectors = {}
+    hidden_dim = None
     errors = 0
 
-    for pair in tqdm(pairs, desc="M4: encoding pairs"):
+    for sent in tqdm(unique, desc="M4 encoding"):
         try:
-            enc1 = client.encode(pair["sentence1"], return_layers=[-1])
-            enc2 = client.encode(pair["sentence2"], return_layers=[-1])
-
-            # Get the last-layer hidden state (mean-pooled or last token)
-            hs1_key = [k for k in enc1.get("hidden_states", {}).keys()
-                       if k in ("last", "layer_-1")][0]
-            hs2_key = [k for k in enc2.get("hidden_states", {}).keys()
-                       if k in ("last", "layer_-1")][0]
-
-            # Decode from base64 if compact mode
-            hs1_raw = enc1["hidden_states"][hs1_key]
-            hs2_raw = enc2["hidden_states"][hs2_key]
-
-            if isinstance(hs1_raw, str):
-                v1 = decode_b64_hidden(hs1_raw)
-                v2 = decode_b64_hidden(hs2_raw)
-            elif isinstance(hs1_raw, list):
-                # Non-compact: list of lists. Take mean across tokens.
-                v1 = np.array(hs1_raw, dtype=np.float32).mean(axis=0)
-                v2 = np.array(hs2_raw, dtype=np.float32).mean(axis=0)
-            else:
-                log.warning(f"  Unknown hidden state format: {type(hs1_raw)}")
-                errors += 1
-                continue
-
-            # Mean-pool if multi-token (v might be [seq_len * hidden_dim])
-            hidden_dim = enc1.get("hidden_dim", None)
-            if hidden_dim and len(v1) > hidden_dim:
-                v1 = v1.reshape(-1, hidden_dim).mean(axis=0)
-                v2 = v2.reshape(-1, hidden_dim).mean(axis=0)
-
-            # Cosine similarity
-            cos = float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8))
-
-            human_scores.append(pair["score"])
-            zombie_cosines.append(cos)
-
+            enc = client.encode(sent, layer=layer)
+            if hidden_dim is None:
+                hidden_dim = enc.get("hidden_dim")
+            mat = extract_vector(enc, hidden_dim)
+            if mat is not None:
+                vectors[sent] = pool(mat, pooling_name)
         except Exception as e:
-            log.warning(f"  Error on pair: {e}")
             errors += 1
-            if errors > 20:
-                log.error("  Too many errors, aborting M4")
+            if errors <= 3:
+                log.warning(f"  Error: {e}")
+            if errors > 30:
                 break
 
-    if len(human_scores) < 30:
-        log.error(f"  Only {len(human_scores)} valid pairs — not enough for correlation")
-        return M4Result(0, 1, 0, 1, len(human_scores), 0, False)
+    log.info(f"  {len(vectors)}/{len(unique)} encoded")
+    if len(vectors) < 30:
+        return M4Result(0, 1, 0, 1, 0, 0, 0, False, layer, pooling_name, centered)
 
-    human_scores = np.array(human_scores)
-    zombie_cosines = np.array(zombie_cosines)
+    if centered:
+        all_vecs = np.stack(list(vectors.values()))
+        mean_vec = all_vecs.mean(axis=0)
+        vectors = {s: v - mean_vec for s, v in vectors.items()}
 
-    sp = stats.spearmanr(human_scores, zombie_cosines)
-    pr = stats.pearsonr(human_scores, zombie_cosines)
+    h, z = [], []
+    for p in pairs:
+        s1, s2 = p["sentence1"], p["sentence2"]
+        if s1 in vectors and s2 in vectors:
+            h.append(p["score"])
+            z.append(cosine(vectors[s1], vectors[s2]))
+
+    h, z = np.array(h), np.array(z)
+    sp = stats.spearmanr(h, z)
+    pr = stats.pearsonr(h, z)
 
     return M4Result(
-        spearman_r=float(sp.statistic),
-        spearman_p=float(sp.pvalue),
-        pearson_r=float(pr.statistic),
-        pearson_p=float(pr.pvalue),
-        n_pairs=len(human_scores),
-        mean_cosine=float(zombie_cosines.mean()),
-        pass_threshold=float(sp.statistic) > 0.6,
+        spearman_r=float(sp.statistic), spearman_p=float(sp.pvalue),
+        pearson_r=float(pr.statistic), pearson_p=float(pr.pvalue),
+        n_pairs=len(h), mean_cosine=float(z.mean()), std_cosine=float(z.std()),
+        pass_threshold=float(sp.statistic) > cfg["m4_threshold"],
+        layer=layer, pooling=pooling_name, centered=centered,
     )
 
 
 # ═══════════════════════════════════════════════════════════════
-# M5 — LatentMAS Gain (Quality vs K)
+# M5 — LatentMAS Gain
 # ═══════════════════════════════════════════════════════════════
 
 @dataclass
@@ -349,216 +348,176 @@ class M5Result:
     displacement_means: list
     displacement_stds: list
     n_questions: int
-    gain_detected: bool  # displacement increases with K
+    gain_detected: bool
+    endpoint_used: str
 
     def summary(self) -> str:
-        status = "✅ Gain detected" if self.gain_detected else "❌ No gain from rumination"
-        lines = [f"M5 LatentMAS Gain ({self.n_questions} questions) {status}"]
-        for k, mean, std in zip(self.k_values, self.displacement_means,
-                                self.displacement_stds):
-            lines.append(f"  K={k:3d}: displacement = {mean:.4f} ± {std:.4f}")
+        s = "✅ Gain detected" if self.gain_detected else "❌ No gain"
+        lines = [f"M5 LatentMAS Gain ({self.n_questions} q, "
+                 f"via {self.endpoint_used}) {s}"]
+        for k, m, sd in zip(self.k_values, self.displacement_means,
+                            self.displacement_stds):
+            bar = "█" * max(1, int(m * 20)) if m > 0 else ""
+            lines.append(f"  K={k:3d}: {m:.4f} ± {sd:.4f}  {bar}")
         return "\n".join(lines)
 
 
-def eval_m5(client: ERISEvalClient, n_questions: int = 30,
+def eval_m5(client: ERISClient, n_questions: int = 30,
             k_values: list = None) -> M5Result:
-    """M5: Does latent rollout (K steps) increase displacement?
-
-    For each question, run latent_think with varying K and measure
-    total_displacement (cosine distance z_0 → z_K).
-    If displacement increases with K, rumination explores the space.
-    """
     if k_values is None:
         k_values = [0, 5, 15, 30, 60]
 
     questions = load_technical_questions(n_questions)
 
+    # Detect working endpoint
+    endpoint = "v1/latent_think"
+    try:
+        client.latent_think("test", n_steps=1)
+    except Exception:
+        endpoint = "think"
+        try:
+            client.think("test", n_steps=1)
+        except Exception:
+            log.error("No think endpoint works")
+            return M5Result(k_values, [0]*len(k_values), [0]*len(k_values),
+                            0, False, "none")
+    log.info(f"Using: {endpoint}")
+
     results_by_k = {k: [] for k in k_values}
     errors = 0
 
-    for q in tqdm(questions, desc="M5: testing K values"):
+    for q in tqdm(questions, desc="M5"):
         for k in k_values:
             try:
-                result = client.latent_think(
-                    q["text"], n_steps=k, return_trajectory=False
-                )
-                disp = result.get("total_displacement",
-                                  result.get("hidden_norm", 0))
-                results_by_k[k].append(disp)
+                if endpoint == "v1/latent_think":
+                    res = client.latent_think(q["text"], n_steps=k)
+                else:
+                    res = client.think(q["text"], n_steps=k)
+
+                disp = (res.get("total_displacement")
+                        or res.get("displacement")
+                        or res.get("hidden_norm", 0))
+                results_by_k[k].append(float(disp))
             except Exception as e:
-                log.warning(f"  Error K={k}: {e}")
                 errors += 1
-                if errors > 50:
+                if errors <= 5:
+                    log.warning(f"  K={k}: {e}")
+                if errors > 80:
                     break
 
-    displacement_means = []
-    displacement_stds = []
-    for k in k_values:
-        vals = results_by_k[k]
-        if vals:
-            displacement_means.append(float(np.mean(vals)))
-            displacement_stds.append(float(np.std(vals)))
-        else:
-            displacement_means.append(0.0)
-            displacement_stds.append(0.0)
+    means = [float(np.mean(results_by_k[k])) if results_by_k[k] else 0 for k in k_values]
+    stds = [float(np.std(results_by_k[k])) if results_by_k[k] else 0 for k in k_values]
+    gain = len(means) >= 2 and means[-1] > means[0] + 0.01
 
-    # Gain detected if displacement is monotonically increasing (mostly)
-    gain = all(displacement_means[i] <= displacement_means[i + 1] + 0.01
-               for i in range(len(displacement_means) - 1))
-
-    return M5Result(
-        k_values=k_values,
-        displacement_means=displacement_means,
-        displacement_stds=displacement_stds,
-        n_questions=len(questions),
-        gain_detected=gain,
-    )
+    return M5Result(k_values, means, stds, len(questions), gain, endpoint)
 
 
 # ═══════════════════════════════════════════════════════════════
-# M1-M3 — A/B/C Comparison (requires Claude API)
+# M1-M3 — A/B/C
 # ═══════════════════════════════════════════════════════════════
 
 @dataclass
 class ABCResult:
     n_questions: int
-    condition_a_scores: list  # Claude direct
-    condition_b_scores: list  # Claude → zombie paraphrase → Claude
-    condition_c_scores: list  # Claude → zombie ruminate → Claude
+    scores_a: list
+    scores_b: list
+    scores_c: list
     mean_a: float
     mean_b: float
     mean_c: float
-    c_better_than_a: float  # fraction where C > A
-    c_better_than_b: float  # fraction where C > B
+    c_vs_a_win: float
+    c_vs_b_win: float
+    wilcoxon_ca_p: float
+    wilcoxon_cb_p: float
 
     def summary(self) -> str:
+        sig_ca = "(*)" if self.wilcoxon_ca_p < 0.05 else "(ns)"
+        sig_cb = "(*)" if self.wilcoxon_cb_p < 0.05 else "(ns)"
         return (
-            f"M1-M3 A/B/C Comparison ({self.n_questions} questions)\n"
-            f"  (A) Claude direct:     mean={self.mean_a:.2f}\n"
-            f"  (B) Claude+paraphrase: mean={self.mean_b:.2f}\n"
-            f"  (C) Claude+ruminate:   mean={self.mean_c:.2f}\n"
-            f"  C > A: {self.c_better_than_a:.0%} of questions\n"
-            f"  C > B: {self.c_better_than_b:.0%} of questions"
+            f"M1-M3 A/B/C ({self.n_questions} questions)\n"
+            f"  (A) Claude direct:     {self.mean_a:.2f}\n"
+            f"  (B) Claude+paraphrase: {self.mean_b:.2f}\n"
+            f"  (C) Claude+ruminate:   {self.mean_c:.2f}\n"
+            f"  C>A: {self.c_vs_a_win:.0%} p={self.wilcoxon_ca_p:.4f} {sig_ca}\n"
+            f"  C>B: {self.c_vs_b_win:.0%} p={self.wilcoxon_cb_p:.4f} {sig_cb}"
         )
 
 
-def eval_abc(client: ERISEvalClient, n_questions: int = 30,
+def eval_abc(client: ERISClient, n_questions: int = 30,
              n_steps: int = 60) -> ABCResult:
-    """M1-M3: Compare Claude direct vs Claude+zombie paraphrase vs Claude+ruminate.
-
-    Requires ANTHROPIC_API_KEY.
-
-    For each question:
-      (A) Claude answers directly
-      (B) Claude answers → zombie paraphrases → Claude answers again with paraphrase
-      (C) Claude answers → zombie ruminates (K steps) → Claude answers with enriched text
-
-    Scoring: Claude Sonnet as judge (separate instance), 1-5 scale on:
-      - Depth of analysis
-      - Presence of reframe/alternative perspective
-      - Unexpected but relevant connection
-    """
     import anthropic
-
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        log.error("ANTHROPIC_API_KEY not set — skipping M1-M3")
-        return ABCResult(0, [], [], [], 0, 0, 0, 0, 0)
+        log.error("ANTHROPIC_API_KEY not set")
+        return ABCResult(0, [], [], [], 0, 0, 0, 0, 0, 1, 1)
 
     claude = anthropic.Anthropic(api_key=api_key)
     questions = load_technical_questions(n_questions)
 
-    scores_a, scores_b, scores_c = [], [], []
+    def ask(messages, max_tokens=512):
+        resp = claude.messages.create(
+            model="claude-sonnet-4-6", max_tokens=max_tokens,
+            messages=messages, timeout=60.0)
+        return resp.content[0].text
 
-    judge_prompt = """Rate this answer on a scale of 1-5 for analytical depth and insight.
-1 = superficial/generic, 5 = deep/insightful with unexpected connections.
-Respond with ONLY a single integer 1-5, nothing else."""
-
-    for q in tqdm(questions, desc="M1-M3: A/B/C comparison"):
+    def judge(question, answer):
         try:
-            # (A) Claude direct
-            resp_a = claude.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=512,
-                messages=[{"role": "user", "content": q["text"]}],
-                timeout=60.0,
-            )
-            text_a = resp_a.content[0].text
+            s = ask([{"role": "user",
+                      "content": f"Question: {question}\n\nAnswer: {answer}\n\n"
+                      "Rate analytical depth 1-5. Reply with ONLY one integer."}],
+                    max_tokens=10)
+            return max(1, min(5, int(s.strip()[0])))
+        except Exception:
+            return 3
 
-            # (B) Claude → zombie paraphrase → Claude
-            bridge_b = client.bridge(text_a, mode="passive", n_steps=0)
-            enriched_b = bridge_b.get("enriched_text", text_a)
-            resp_b = claude.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=512,
-                messages=[
-                    {"role": "user", "content": q["text"]},
-                    {"role": "assistant", "content": text_a},
-                    {"role": "user",
-                     "content": f"Here's a complementary analysis:\n{enriched_b}\n\nNow give your final, improved answer."},
-                ],
-                timeout=60.0,
-            )
-            text_b = resp_b.content[0].text
+    sa, sb, sc = [], [], []
+    for q in tqdm(questions, desc="ABC"):
+        try:
+            text_a = ask([{"role": "user", "content": q["text"]}])
 
-            # (C) Claude → zombie ruminate → Claude
-            bridge_c = client.bridge(text_a, mode="ruminate", n_steps=n_steps)
-            enriched_c = bridge_c.get("enriched_text", text_a)
-            resp_c = claude.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=512,
-                messages=[
-                    {"role": "user", "content": q["text"]},
-                    {"role": "assistant", "content": text_a},
-                    {"role": "user",
-                     "content": f"Here's a deep complementary analysis:\n{enriched_c}\n\nNow give your final, improved answer."},
-                ],
-                timeout=60.0,
-            )
-            text_c = resp_c.content[0].text
+            br_b = client.bridge(text_a, mode="passive", n_steps=0)
+            enr_b = br_b.get("enriched_text", br_b.get("decoded_text", text_a))
+            text_b = ask([
+                {"role": "user", "content": q["text"]},
+                {"role": "assistant", "content": text_a},
+                {"role": "user",
+                 "content": f"Complementary perspective:\n{enr_b}\n\nImproved answer:"},
+            ])
 
-            # Judge all three (using separate Claude call)
-            for text, scores_list in [(text_a, scores_a), (text_b, scores_b),
-                                       (text_c, scores_c)]:
-                judge_resp = claude.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=10,
-                    messages=[
-                        {"role": "user",
-                         "content": f"Question: {q['text']}\n\nAnswer: {text}\n\n{judge_prompt}"},
-                    ],
-                    timeout=30.0,
-                )
-                try:
-                    score = int(judge_resp.content[0].text.strip()[0])
-                    score = max(1, min(5, score))
-                except (ValueError, IndexError):
-                    score = 3  # neutral fallback
-                scores_list.append(score)
+            br_c = client.bridge(text_a, mode="ruminate", n_steps=n_steps)
+            enr_c = br_c.get("enriched_text", br_c.get("decoded_text", text_a))
+            text_c = ask([
+                {"role": "user", "content": q["text"]},
+                {"role": "assistant", "content": text_a},
+                {"role": "user",
+                 "content": f"Deep analysis:\n{enr_c}\n\nImproved answer:"},
+            ])
 
-            # Rate limit
-            time.sleep(1.0)
-
+            sa.append(judge(q["text"], text_a))
+            sb.append(judge(q["text"], text_b))
+            sc.append(judge(q["text"], text_c))
+            time.sleep(0.5)
         except Exception as e:
-            log.warning(f"  Error on question: {e}")
-            continue
+            log.warning(f"  ABC error: {e}")
 
-    n = min(len(scores_a), len(scores_b), len(scores_c))
-    if n == 0:
-        return ABCResult(0, [], [], [], 0, 0, 0, 0, 0)
+    n = min(len(sa), len(sb), len(sc))
+    if n < 5:
+        return ABCResult(n, sa, sb, sc, 0, 0, 0, 0, 0, 1, 1)
+    sa, sb, sc = sa[:n], sb[:n], sc[:n]
 
-    sa, sb, sc = scores_a[:n], scores_b[:n], scores_c[:n]
+    try:
+        w_ca = stats.wilcoxon([c - a for a, c in zip(sa, sc)])
+        w_cb = stats.wilcoxon([c - b for b, c in zip(sb, sc)])
+    except Exception:
+        w_ca = type("W", (), {"pvalue": 1.0})()
+        w_cb = type("W", (), {"pvalue": 1.0})()
 
     return ABCResult(
-        n_questions=n,
-        condition_a_scores=sa,
-        condition_b_scores=sb,
-        condition_c_scores=sc,
-        mean_a=float(np.mean(sa)),
-        mean_b=float(np.mean(sb)),
-        mean_c=float(np.mean(sc)),
-        c_better_than_a=float(np.mean([c > a for a, c in zip(sa, sc)])),
-        c_better_than_b=float(np.mean([c > b for b, c in zip(sb, sc)])),
+        n, sa, sb, sc,
+        float(np.mean(sa)), float(np.mean(sb)), float(np.mean(sc)),
+        float(np.mean([c > a for a, c in zip(sa, sc)])),
+        float(np.mean([c > b for b, c in zip(sb, sc)])),
+        float(w_ca.pvalue), float(w_cb.pvalue),
     )
 
 
@@ -569,180 +528,140 @@ Respond with ONLY a single integer 1-5, nothing else."""
 @dataclass
 class M6Result:
     n_questions: int
-    mean_implicit_features: float
-    mean_total_features: float
+    mean_implicit: float
+    mean_total: float
     implicit_ratio: float
-    examples: list  # top 5 most interesting implicit features
+    sae_available: bool
+    examples: list
 
     def summary(self) -> str:
+        if not self.sae_available:
+            return "M6 Implicit Features — SAE not configured (skipped)"
         return (
             f"M6 Implicit Features ({self.n_questions} questions)\n"
-            f"  Mean total SAE features: {self.mean_total_features:.1f}\n"
-            f"  Mean implicit features:  {self.mean_implicit_features:.1f}\n"
-            f"  Implicit ratio:          {self.implicit_ratio:.1%}\n"
-            f"  (Features activated in latent space but absent from surface text)"
+            f"  Total SAE features:  {self.mean_total:.1f}\n"
+            f"  Implicit features:   {self.mean_implicit:.1f}\n"
+            f"  Ratio:               {self.implicit_ratio:.1%}"
         )
 
 
-def eval_m6(client: ERISEvalClient, n_questions: int = 20) -> M6Result:
-    """M6: Does the zombie detect features not present in the surface text?
-
-    For each question, encode via zombie, run SAE analysis, and count
-    features whose labels don't match any token in the input text.
-    Requires SAE analyzer configured in eris_config.yaml.
-    """
+def eval_m6(client: ERISClient, n_questions: int = 20) -> M6Result:
     questions = load_technical_questions(n_questions)
+    totals, implicits, examples = [], [], []
+    sae_ok = True
 
-    total_features_list = []
-    implicit_features_list = []
-    examples = []
-
-    for q in tqdm(questions, desc="M6: implicit features"):
+    for q in tqdm(questions, desc="M6"):
         try:
-            result = client.bridge(
-                q["text"], mode="analyze_only", n_steps=0,
-                analyses=["sae_features"]
-            )
-
-            analysis = result.get("analysis", {})
-            sae = analysis.get("sae_features", None)
-            implicit = analysis.get("implicit_features", None)
-
+            res = client.bridge(q["text"], mode="analyze_only", n_steps=0,
+                                analyses=["sae_features"])
+            an = res.get("analysis", {})
+            sae = an.get("sae_features")
             if sae is None:
-                log.info("  SAE analyzer not configured — skipping M6")
-                return M6Result(0, 0, 0, 0, [])
-
-            total_count = len(sae.get("top_20", sae.get("top_10", [])))
-            implicit_count = len(implicit) if implicit else 0
-
-            total_features_list.append(total_count)
-            implicit_features_list.append(implicit_count)
-
-            if implicit and len(examples) < 5:
-                examples.append({
-                    "question": q["text"][:100],
-                    "implicit": implicit[:3],
-                })
-
+                sae_ok = False
+                break
+            imp = an.get("implicit_features", [])
+            totals.append(len(sae.get("top_20", sae.get("top_10", []))))
+            implicits.append(len(imp))
+            if imp and len(examples) < 5:
+                examples.append({"q": q["text"][:80], "implicit": imp[:3]})
         except Exception as e:
-            log.warning(f"  Error: {e}")
-            continue
+            log.warning(f"  M6: {e}")
 
-    n = len(total_features_list)
-    if n == 0:
-        return M6Result(0, 0, 0, 0, [])
-
-    mean_total = float(np.mean(total_features_list))
-    mean_implicit = float(np.mean(implicit_features_list))
-
-    return M6Result(
-        n_questions=n,
-        mean_implicit_features=mean_implicit,
-        mean_total_features=mean_total,
-        implicit_ratio=mean_implicit / max(mean_total, 1),
-        examples=examples,
-    )
+    if not totals:
+        return M6Result(0, 0, 0, 0, sae_ok, [])
+    mt, mi = float(np.mean(totals)), float(np.mean(implicits))
+    return M6Result(len(totals), mi, mt, mi / max(mt, 1), sae_ok, examples)
 
 
 # ═══════════════════════════════════════════════════════════════
-# Main — orchestrate all evaluations
+# Main
 # ═══════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="ERIS v5 Phase 1 Evaluation")
-    parser.add_argument("--eris-url", default="http://localhost:8001",
-                        help="ERIS server URL")
-    parser.add_argument("--metric", default="all",
-                        choices=["all", "m4", "m5", "m6", "abc"],
-                        help="Which metric(s) to evaluate")
-    parser.add_argument("--n-pairs", type=int, default=200,
-                        help="Number of STS-B pairs for M4")
-    parser.add_argument("--n-questions", type=int, default=30,
-                        help="Number of questions for M5/ABC/M6")
-    parser.add_argument("--n-steps", type=int, default=60,
-                        help="Latent rollout steps")
-    parser.add_argument("--tag", default="default",
-                        help="Tag for this run (e.g. 'qwen35-4b')")
-    parser.add_argument("--output-dir", default="eval_results",
-                        help="Directory to save results")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for reproducibility")
+    parser = argparse.ArgumentParser(description="ERIS v5 Phase 1")
+    parser.add_argument("--eris-url", default="http://localhost:8001")
+    parser.add_argument("--metric", nargs="+", default=["all"],
+                        choices=["all", "m4", "m5", "m6", "abc"])
+    parser.add_argument("--n-pairs", type=int, default=200)
+    parser.add_argument("--n-questions", type=int, default=30)
+    parser.add_argument("--n-steps", type=int, default=60)
+    parser.add_argument("--tag", default="default")
+    parser.add_argument("--output-dir", default="eval_results")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     np.random.seed(args.seed)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(exist_ok=True)
+    metrics = set(args.metric)
+    if "all" in metrics:
+        metrics = {"m4", "m5", "m6", "abc"}
 
-    client = ERISEvalClient(args.eris_url)
-    results = {"tag": args.tag, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
+    Path(args.output_dir).mkdir(exist_ok=True)
+    client = ERISClient(args.eris_url)
+    health = client.health()
+    model = health.get("model", "unknown")
+    cfg = get_model_config(model)
+    log.info(f"Model: {model}, Config: {cfg}")
+
+    results = {"tag": args.tag, "model": model, "config": cfg,
+               "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
 
     try:
-        # ── M4: Projection Fidelity ──
-        if args.metric in ("all", "m4"):
-            log.info("=" * 60)
-            log.info("M4 — Projection Fidelity (STS-B)")
-            log.info("=" * 60)
-            m4 = eval_m4(client, n_pairs=args.n_pairs)
+        if "m4" in metrics:
+            log.info("=" * 60 + "\nM4 — Projection Fidelity\n" + "=" * 60)
+            m4 = eval_m4(client, cfg, n_pairs=args.n_pairs)
             print(f"\n{m4.summary()}\n")
             results["m4"] = asdict(m4)
 
-        # ── M5: LatentMAS Gain ──
-        if args.metric in ("all", "m5"):
-            log.info("=" * 60)
-            log.info("M5 — LatentMAS Gain (displacement vs K)")
-            log.info("=" * 60)
+        if "m5" in metrics:
+            log.info("=" * 60 + "\nM5 — LatentMAS Gain\n" + "=" * 60)
             m5 = eval_m5(client, n_questions=args.n_questions)
             print(f"\n{m5.summary()}\n")
             results["m5"] = asdict(m5)
 
-        # ── M6: Implicit Features ──
-        if args.metric in ("all", "m6"):
-            log.info("=" * 60)
-            log.info("M6 — Implicit Features (SAE)")
-            log.info("=" * 60)
+        if "m6" in metrics:
+            log.info("=" * 60 + "\nM6 — Implicit Features\n" + "=" * 60)
             m6 = eval_m6(client, n_questions=min(20, args.n_questions))
             print(f"\n{m6.summary()}\n")
             results["m6"] = asdict(m6)
 
-        # ── M1-M3: A/B/C Comparison ──
-        if args.metric in ("all", "abc"):
-            log.info("=" * 60)
-            log.info("M1-M3 — A/B/C Comparison (requires ANTHROPIC_API_KEY)")
-            log.info("=" * 60)
+        if "abc" in metrics:
+            log.info("=" * 60 + "\nM1-M3 — A/B/C Comparison\n" + "=" * 60)
             abc = eval_abc(client, n_questions=args.n_questions,
                            n_steps=args.n_steps)
             if abc.n_questions > 0:
                 print(f"\n{abc.summary()}\n")
             results["abc"] = asdict(abc)
-
     finally:
         client.close()
 
-    # ── Save results ──
-    out_file = output_dir / f"phase1_{args.tag}_{time.strftime('%Y%m%d_%H%M%S')}.json"
-    with open(out_file, "w") as f:
+    out = Path(args.output_dir) / f"phase1_{args.tag}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+    with open(out, "w") as f:
         json.dump(results, f, indent=2, default=str)
-    log.info(f"Results saved to {out_file}")
+    log.info(f"Saved to {out}")
 
-    # ── Summary ──
+    # Summary
     print("\n" + "=" * 60)
-    print("PHASE 1 SUMMARY")
+    print(f"PHASE 1 — {model}")
     print("=" * 60)
     if "m4" in results:
-        m4r = results["m4"]
-        status = "✅" if m4r["pass_threshold"] else "❌"
-        print(f"  M4 Projection Fidelity: Spearman={m4r['spearman_r']:.4f} {status}")
+        r = results["m4"]
+        print(f"  M4 Projection:  ρ={r['spearman_r']:.4f} "
+              f"{'✅' if r['pass_threshold'] else '❌'}")
     if "m5" in results:
-        m5r = results["m5"]
-        status = "✅" if m5r["gain_detected"] else "❌"
-        print(f"  M5 LatentMAS Gain:      {status}")
+        r = results["m5"]
+        print(f"  M5 LatentMAS:   {'✅' if r['gain_detected'] else '❌'}  "
+              f"K=0→{r['displacement_means'][0]:.4f}  "
+              f"K=60→{r['displacement_means'][-1]:.4f}")
     if "m6" in results:
-        m6r = results["m6"]
-        print(f"  M6 Implicit Features:   ratio={m6r['implicit_ratio']:.1%}")
+        r = results["m6"]
+        if r["sae_available"]:
+            print(f"  M6 Implicit:    {r['implicit_ratio']:.1%}")
+        else:
+            print(f"  M6 Implicit:    SAE n/a")
     if "abc" in results and results["abc"]["n_questions"] > 0:
-        ar = results["abc"]
-        print(f"  M1-M3 A/B/C:           C>A={ar['c_better_than_a']:.0%}, "
-              f"C>B={ar['c_better_than_b']:.0%}")
+        r = results["abc"]
+        print(f"  ABC:  A={r['mean_a']:.2f} B={r['mean_b']:.2f} "
+              f"C={r['mean_c']:.2f}  C>A={r['c_vs_a_win']:.0%}")
     print("=" * 60)
 
 
