@@ -204,7 +204,7 @@ For details on LatentMAS, see the [paper](https://arxiv.org/abs/2511.20639).
 | Model family | Architecture | Status |
 |---|---|---|
 | Qwen3-4B / 8B / 14B / 32B | Standard Transformer | ✅ Validated |
-| Qwen3.5-0.8B / 4B / 9B / 35B | Hybrid GDN + Full Attention | ✅ Validated |
+| Qwen3.5-0.8B / 4B / 9B / 35B | Hybrid GDN + Full Attention | ✅ Engine validated (0.8B runtime tested) |
 | DeepSeek-V2-Lite | MLA | ✅ Validated (patch in `patches/`) |
 | GLM-5 sparse attention | Non-standard | ❌ Not supported |
 
