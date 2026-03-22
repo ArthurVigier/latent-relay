@@ -1,0 +1,8 @@
+# Gitleaks configuration
+# See https://github.com/gitleaks/gitleaks#configuration
+
+[allowlist]
+  description = "Test scripts with placeholder API keys"
+  # "latent-relay-key" in run_openclaw_tests.sh is a placeholder used in
+  # curl test commands, not a real secret.
+  paths = ['''openclaw_compat/run_openclaw_tests\.sh''']
