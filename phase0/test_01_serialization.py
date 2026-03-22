@@ -83,7 +83,7 @@ def benchmark_serialize_naive(kv_cache: list, n_runs: int = 5) -> dict:
         cpu_cache = [(k.cpu(), v.cpu()) for k, v in kv_cache]
         # CPU → bytes
         buf = io.BytesIO()
-        torch.save(cpu_cache, buf)
+        torch.save(cpu_cache, buf)  # nosemgrep: trailofbits.python.pickles-in-pytorch.pickles-in-pytorch
         blob = buf.getvalue()
 
         torch.cuda.synchronize()

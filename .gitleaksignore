@@ -1,0 +1,3 @@
+# False positive: "latent-relay-key" is a placeholder API key used in curl
+# test scripts, not a real secret. See openclaw_compat/run_openclaw_tests.sh.
+7ad5a689264d10e9c1d2d3553ee1b8a072a3cbd0:openclaw_compat/run_openclaw_tests.sh:curl-auth-header:118

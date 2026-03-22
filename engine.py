@@ -11,12 +11,14 @@ This is the core engine — no HTTP/MCP dependencies. Can be used by:
   - Direct Python usage
 """
 
+import base64
 import time
 import uuid
+import numpy as np
 import torch
 import threading
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Callable, Dict, List, Optional, Tuple, Any, Union
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
@@ -35,6 +37,9 @@ class LatentThought:
     created_at: float
     kv_cache: Optional[Tuple] = field(repr=False, default=None)
     hidden_embedding: Optional[torch.Tensor] = field(repr=False, default=None)
+    # Per-layer hidden states stored on CPU (populated by encode()).
+    # Keys: "layer_N" or "last".  Values: float32 tensors [seq_len, hidden_dim].
+    layer_hidden_states: Optional[Dict[str, torch.Tensor]] = field(repr=False, default=None)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -112,7 +117,7 @@ class LatentRelayEngine:
     @staticmethod
     def _past_length(past_kv) -> int:
         """Get sequence length from past_key_values.
-
+        
         Handles both DynamicCache (transformers >= 4.36) and legacy tuple format.
         """
         if past_kv is None:
@@ -129,6 +134,62 @@ class LatentRelayEngine:
         if isinstance(past_kv, (list, tuple)) and len(past_kv) > 0:
             return past_kv[0][0].shape[-2]
         return 0
+
+    # ──────────────────────────────────────────────
+    # Hidden-state helpers
+    # ──────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_layer_key(layer_idx: int, n_layers: int) -> Tuple[int, str]:
+        """
+        Convert a layer index (possibly -1) to an absolute index and a string key.
+
+        ``outputs.hidden_states`` has shape (n_layers + 1,) — index 0 is the
+        embedding layer, indices 1..n_layers are transformer layers.
+        -1 maps to the final transformer layer.
+        """
+        total = n_layers + 1  # embedding layer + transformer layers
+        if layer_idx == -1:
+            return total - 1, "last"
+        if not (0 <= layer_idx < total):
+            raise ValueError(
+                f"Layer index {layer_idx} out of range [0, {total - 1}] "
+                f"(model has {n_layers} transformer layers)"
+            )
+        return layer_idx, f"layer_{layer_idx}"
+
+    @staticmethod
+    def _tensor_to_payload(t: torch.Tensor, compact: bool = True) -> Union[str, list]:
+        """
+        Serialise a hidden-state tensor for JSON transport.
+
+        Args:
+            t: Tensor of shape [seq_len, hidden_dim], any dtype.
+            compact: If True (default), return a base64-encoded string of the
+                     raw float32 bytes.  If False, return a nested Python list
+                     of floats (human-readable but ~4× larger).
+
+        Returns:
+            base64 string or nested list of floats.
+        """
+        arr = t.detach().cpu().float().numpy()  # → float32 numpy array
+        if compact:
+            return base64.b64encode(arr.tobytes()).decode("ascii")
+        return arr.tolist()
+
+    @staticmethod
+    def _payload_to_tensor(payload: Union[str, list], shape: Tuple[int, int]) -> torch.Tensor:
+        """
+        Deserialise a hidden-state payload back to a float32 tensor.
+
+        Args:
+            payload: base64 string or nested list (as returned by _tensor_to_payload).
+            shape: (seq_len, hidden_dim) — required when payload is a base64 string.
+        """
+        if isinstance(payload, str):
+            arr = np.frombuffer(base64.b64decode(payload), dtype=np.float32).reshape(shape)
+            return torch.from_numpy(arr.copy())
+        return torch.tensor(payload, dtype=torch.float32)
 
     # ──────────────────────────────────────────────
     # Public API
@@ -161,6 +222,129 @@ class LatentRelayEngine:
             ]
 
     @torch.no_grad()
+    def encode(
+        self,
+        text: str,
+        *,
+        return_layers: Optional[List[int]] = None,
+        return_attention: bool = False,
+        session_id: Optional[str] = None,
+        compact: bool = True,
+    ) -> Dict:
+        """
+        Encode text and expose hidden states for the requested layers.
+
+        Performs a single forward pass with ``output_hidden_states=True`` and
+        returns the hidden states for the requested transformer layers.  The
+        result is optionally stored as a :class:`LatentThought` if a
+        ``session_id`` is provided.
+
+        Args:
+            text: Input text to encode.
+            return_layers: Layer indices to return.  Use -1 for the last layer.
+                           Defaults to ``[-1]`` (last layer only).
+            return_attention: If True, also return per-layer attention weights
+                              (``output_attentions=True``).  Increases latency.
+            session_id: If given, store the result in this session and return a
+                        handle.  The session must already exist.
+            compact: If True (default), hidden states are base64-encoded float32
+                     bytes.  If False, they are returned as nested float lists
+                     (human-readable but ~4× larger).
+
+        Returns:
+            Dict with keys:
+              - ``handle`` (str | None): storage handle, None if no session_id
+              - ``hidden_states`` (dict): layer_key → base64 str or list
+              - ``tokens`` (list[str]): token strings from the tokenizer
+              - ``seq_len`` (int)
+              - ``hidden_dim`` (int)
+
+        Example curl::
+
+            curl -X POST http://localhost:8001/v1/encode \\
+              -H 'Content-Type: application/json' \\
+              -d '{"text": "Hello world", "return_layers": [15, -1]}'
+        """
+        if return_layers is None:
+            return_layers = [-1]
+
+        # Tokenise
+        encoded = self.tokenizer(text, return_tensors="pt", add_special_tokens=True)
+        input_ids = encoded["input_ids"].to(self.device)
+        attention_mask = encoded["attention_mask"].to(self.device)
+        seq_len: int = input_ids.shape[-1]
+
+        # Forward pass
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+            output_hidden_states=True,
+            output_attentions=return_attention,
+            return_dict=True,
+        )
+
+        # ``outputs.hidden_states`` is a tuple of length n_layers + 1.
+        # Index 0 is the embedding layer; indices 1..n_layers are transformer layers.
+        all_hs = outputs.hidden_states  # tuple of [1, seq_len, hidden_dim]
+        n_transformer_layers: int = len(all_hs) - 1
+        hidden_dim: int = all_hs[-1].shape[-1]
+
+        # Extract requested layers — deduplicate while preserving order
+        seen: set = set()
+        unique_layers = [l for l in return_layers if not (l in seen or seen.add(l))]
+
+        layer_hidden_states: Dict[str, torch.Tensor] = {}
+        hidden_states_payload: Dict[str, Union[str, list]] = {}
+
+        for layer_idx in unique_layers:
+            abs_idx, key = self._resolve_layer_key(layer_idx, n_transformer_layers)
+            hs_cpu = all_hs[abs_idx][0].detach().cpu().float()  # [seq_len, hidden_dim]
+            layer_hidden_states[key] = hs_cpu
+            hidden_states_payload[key] = self._tensor_to_payload(hs_cpu, compact=compact)
+
+        # Token strings (skip special if desired — expose raw for transparency)
+        tokens: List[str] = self.tokenizer.convert_ids_to_tokens(
+            input_ids[0].tolist()
+        )
+
+        # Optionally store in session
+        handle: Optional[str] = None
+        if session_id is not None:
+            with self._lock:
+                session = self._sessions.get(session_id)
+            if session is None:
+                raise ValueError(f"Session {session_id} not found")
+
+            handle = f"enc_{session_id}_{uuid.uuid4().hex[:8]}"
+            thought = LatentThought(
+                handle=handle,
+                session_id=session_id,
+                n_positions=self._past_length(outputs.past_key_values),
+                role="encode",
+                created_at=time.time(),
+                kv_cache=outputs.past_key_values,
+                hidden_embedding=all_hs[-1][0, -1, :].detach(),
+                layer_hidden_states=layer_hidden_states,
+                metadata={
+                    "source": "encode",
+                    "seq_len": seq_len,
+                    "hidden_dim": hidden_dim,
+                    "layers_stored": list(layer_hidden_states.keys()),
+                },
+            )
+            with self._lock:
+                session.thoughts[handle] = thought
+
+        return {
+            "handle": handle,
+            "hidden_states": hidden_states_payload,
+            "tokens": tokens,
+            "seq_len": seq_len,
+            "hidden_dim": hidden_dim,
+        }
+
+    @torch.no_grad()
     def think(
         self,
         session_id: str,
@@ -169,19 +353,41 @@ class LatentRelayEngine:
         n_steps: int = 60,
         role: str = "general",
         inherit_from: Optional[List[str]] = None,
+        # ── ERIS extensions ──────────────────────────────────────────────────
+        return_trajectory: bool = False,
+        perturbation: Optional[torch.Tensor] = None,
+        a_hat_fn: Optional[Callable[[torch.Tensor], float]] = None,
     ) -> Dict:
         """
         Run latent reasoning on a prompt.
 
         Args:
-            session_id: Active session ID
-            prompt: Text prompt for the agent
-            n_steps: Number of latent rollout steps (0 = just encode)
-            role: Agent role label (planner, critic, refiner, etc.)
-            inherit_from: List of thought handles to inherit KV-cache from
+            session_id: Active session ID.
+            prompt: Text prompt for the agent.
+            n_steps: Number of latent rollout steps (0 = just encode).
+            role: Agent role label (planner, critic, refiner, etc.).
+            inherit_from: List of thought handles to inherit KV-cache from.
+            return_trajectory: If True, include per-step metrics in the response
+                               (``trajectory`` list + ``total_displacement``).
+            perturbation: Optional float32 tensor of shape ``[hidden_dim]`` or
+                          ``[1, hidden_dim]``.  Added to the initial hidden state
+                          before the first rollout step (one-shot steering).
+            a_hat_fn: Optional callable ``(hidden: Tensor) -> float`` that returns
+                      the Â-hat agentivity score for a hidden state.  When provided,
+                      the score is recorded at each trajectory step.  Pass the
+                      AHatAnalyzer's score method from eris/analyzers.py.
 
         Returns:
-            Dict with handle, metadata, timing info
+            Dict with handle, metadata, timing info.  When ``return_trajectory``
+            is True, also includes ``trajectory`` (list of per-step dicts) and
+            ``total_displacement`` (float).
+
+        Example curl::
+
+            curl -X POST http://localhost:8001/think \\
+              -H 'Content-Type: application/json' \\
+              -d '{"session_id": "...", "prompt": "hello", "n_steps": 10,
+                   "return_trajectory": true}'
         """
         with self._lock:
             session = self._sessions.get(session_id)
@@ -193,8 +399,8 @@ class LatentRelayEngine:
         # Build inherited KV-cache
         past_kv = None
         if inherit_from:
-            for handle in inherit_from:
-                thought = session.thoughts.get(handle)
+            for inh_handle in inherit_from:
+                thought = session.thoughts.get(inh_handle)
                 if thought and thought.kv_cache is not None:
                     past_kv = thought.kv_cache
 
@@ -224,7 +430,18 @@ class LatentRelayEngine:
             return_dict=True,
         )
         past = outputs.past_key_values
-        last_hidden = outputs.hidden_states[-1][:, -1, :]
+        last_hidden = outputs.hidden_states[-1][:, -1, :]  # [1, hidden_dim]
+
+        # Apply one-shot perturbation before the rollout starts
+        if perturbation is not None:
+            pert = perturbation.to(self.device, dtype=last_hidden.dtype)
+            last_hidden = last_hidden + pert.reshape(1, -1)
+
+        # Lazy-import TrajectoryTracker to avoid circular deps at module load
+        tracker = None
+        if return_trajectory:
+            from eris.trajectory import TrajectoryTracker
+            tracker = TrajectoryTracker(z0=last_hidden)
 
         # Latent rollout: h -> W_a -> forward -> h'
         for step in range(n_steps):
@@ -246,6 +463,10 @@ class LatentRelayEngine:
             )
             past = outputs.past_key_values
             last_hidden = outputs.hidden_states[-1][:, -1, :]
+
+            if tracker is not None:
+                a_hat_score = a_hat_fn(last_hidden) if a_hat_fn is not None else None
+                tracker.record(step=step, hidden=last_hidden, a_hat_score=a_hat_score)
 
         elapsed = time.time() - t0
 
@@ -269,7 +490,7 @@ class LatentRelayEngine:
         with self._lock:
             session.thoughts[handle] = thought
 
-        return {
+        result: Dict = {
             "handle": handle,
             "session_id": session_id,
             "role": role,
@@ -278,6 +499,12 @@ class LatentRelayEngine:
             "elapsed_s": round(elapsed, 3),
             "hidden_norm": round(last_hidden.norm().item(), 2),
         }
+
+        if tracker is not None:
+            result["trajectory"] = tracker.to_list()
+            result["total_displacement"] = round(tracker.total_displacement, 4)
+
+        return result
 
     @torch.no_grad()
     def collaborate(

@@ -1,0 +1,38 @@
+# ERIS v5 — Configuration
+# ========================
+# All optional sections (sae, a_hat, concept_vectors) can be omitted
+# or left with null paths — the system degrades gracefully.
+
+# ── Zombie model ────────────────────────────────────────────────────────────
+model_name: "Qwen/Qwen3-14B"   # or "Qwen/Qwen3-32B", "deepseek-ai/DeepSeek-V2-Lite"
+device: "cuda:0"
+
+# Default number of latent rollout steps (can be overridden per-request).
+default_n_steps: 60
+
+# ── SAE (Sparse Autoencoder) — optional ─────────────────────────────────────
+sae:
+  # model_path: "/path/to/sae_weights"   # directory or .pt file (sae-lens format)
+  model_path: null
+  layer: -1          # which hidden layer the SAE was trained on (-1 = last)
+  # labels_path: "/path/to/feature_labels.json"
+  labels_path: null
+  top_k: 20          # number of top features to return
+
+# ── Â-hat agentivity probe — optional ────────────────────────────────────────
+a_hat:
+  # model_path: "/path/to/a_hat_probe.pt"   # checkpoint from a-hat-optimizer
+  model_path: null
+  layer: -1
+
+# ── Concept vectors for cosine map — optional ────────────────────────────────
+concept_vectors:
+  # Directory containing one .pt or .npy file per concept.
+  # File stem is used as the concept name: "game_theory.pt" → "game_theory"
+  vectors_dir: "configs/concept_vectors"
+
+# ── HTTP server ──────────────────────────────────────────────────────────────
+server:
+  host: "0.0.0.0"
+  port: 8001
+  max_payload_bytes: 52428800   # 50 MB — max size of base64 hidden state payloads

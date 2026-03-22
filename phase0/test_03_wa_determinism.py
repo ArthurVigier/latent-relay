@@ -123,12 +123,12 @@ def test_determinism(compute_fn, **kwargs) -> dict:
 def test_save_load(wa: torch.Tensor, save_path: str) -> dict:
     """Save W_a to disk, reload, verify identical."""
     print(f"    Saving W_a to {save_path}...")
-    torch.save(wa, save_path)
+    torch.save(wa, save_path)  # nosemgrep: trailofbits.python.pickles-in-pytorch.pickles-in-pytorch
     file_size = os.path.getsize(save_path)
     print(f"      → {file_size / (1024*1024):.1f} MB")
 
     print("    Loading W_a from disk...")
-    wa_loaded = torch.load(save_path, map_location=wa.device, weights_only=True)
+    wa_loaded = torch.load(save_path, map_location=wa.device, weights_only=True)  # nosemgrep: trailofbits.python.pickles-in-pytorch.pickles-in-pytorch
 
     is_identical = torch.equal(wa, wa_loaded)
     max_diff = (wa.float() - wa_loaded.float()).abs().max().item()

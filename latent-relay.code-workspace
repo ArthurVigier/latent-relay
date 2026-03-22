@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "latent-relay",
+			"path": "."
+		},
+		{
+			"name": "openclaw_compat",
+			"path": "../openclaw_compat"
+		}
+	],
+  "settings": {}
+}

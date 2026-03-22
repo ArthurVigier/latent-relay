@@ -10,3 +10,4 @@ build/
 *.safetensors
 phase0/phase0_results/
 .env
+.ai-rsk/
