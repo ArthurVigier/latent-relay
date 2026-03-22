@@ -285,7 +285,7 @@ The CI pipeline (`.github/workflows/test.yml`) runs `ai-rsk scan` as a gate befo
 - Requires all agents to use the same model (same architecture, same weights)
 - KV-caches live in GPU memory — limited by VRAM
 - Trajectory storage is CPU-side (hidden states copied at each step)
-- The `collaborate` step re-encodes the final prompt (no inherited KV-cache in `generate` due to position encoding issues with some models)
+- The `collaborate` step passes the accumulated KV-cache into `generate()` — set `use_latent_context=False` to fall back to prompt-only generation
 - Small models (4B) struggle with OpenClaw's large system prompts (~58KB)
 - SAE and Â-hat analyzers require pre-trained checkpoints not included in this repo
 - Only tested on math reasoning tasks (GSM8K) for the base LatentMAS layer

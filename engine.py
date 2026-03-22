@@ -592,12 +592,14 @@ class LatentRelayEngine:
         max_new_tokens: int = 512,
         temperature: float = 0.6,
         top_p: float = 0.95,
+        use_latent_context: bool = True,
     ) -> Dict:
         """
         Combine latent thoughts and generate a text answer.
 
-        Re-encodes the final prompt without inherited KV-cache to avoid
-        position encoding misalignment issues with some models.
+        Passes the accumulated KV-cache from the last handle into generate()
+        so the latent reasoning context actually influences generation.
+        Set use_latent_context=False to fall back to prompt-only generation.
         """
         with self._lock:
             session = self._sessions.get(session_id)
@@ -606,14 +608,21 @@ class LatentRelayEngine:
 
         t0 = time.time()
 
-        # Encode final prompt and generate directly
+        # Find the accumulated KV-cache from the most recent handle
+        past_kv = None
+        if use_latent_context:
+            for handle in reversed(handles):
+                thought = session.thoughts.get(handle)
+                if thought and thought.kv_cache is not None:
+                    past_kv = thought.kv_cache
+                    break
+
         encoded = self.tokenizer(
             final_prompt, return_tensors="pt", add_special_tokens=True
         )
         input_ids = encoded["input_ids"].to(self.device)
 
-        gen_outputs = self.model.generate(
-            input_ids=input_ids,
+        generate_kwargs: Dict[str, Any] = dict(
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
@@ -621,6 +630,18 @@ class LatentRelayEngine:
             repetition_penalty=1.2,
             pad_token_id=self.tokenizer.pad_token_id,
         )
+
+        if past_kv is not None:
+            past_len = self._past_length(past_kv)
+            attention_mask = torch.ones(
+                (1, past_len + input_ids.shape[1]),
+                dtype=torch.long,
+                device=self.device,
+            )
+            generate_kwargs["past_key_values"] = past_kv
+            generate_kwargs["attention_mask"] = attention_mask
+
+        gen_outputs = self.model.generate(input_ids=input_ids, **generate_kwargs)
 
         # Decode only the new tokens
         prompt_len = input_ids.shape[-1]
@@ -634,6 +655,7 @@ class LatentRelayEngine:
             "tokens_generated": len(new_tokens),
             "handles_used": handles,
             "elapsed_s": round(elapsed, 3),
+            "latent_context_used": past_kv is not None,
         }
 
     def get_thought_info(self, session_id: str, handle: str) -> Optional[Dict]:
