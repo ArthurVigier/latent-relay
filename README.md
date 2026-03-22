@@ -201,9 +201,14 @@ For details on LatentMAS, see the [paper](https://arxiv.org/abs/2511.20639).
 
 ## Compatible models
 
-Tested with Qwen3-4B and Qwen3-8B. ERIS v5 targets Qwen3-14B/32B. Should work with any HuggingFace model that uses standard KV-cache (`past_key_values`) and supports `output_hidden_states=True`. A patch for DeepSeek-V2 MLA models is included in `patches/`.
+| Model family | Architecture | Status |
+|---|---|---|
+| Qwen3-4B / 8B / 14B / 32B | Standard Transformer | ✅ Validated |
+| Qwen3.5-0.8B / 4B / 9B / 35B | Hybrid GDN + Full Attention | ✅ Validated |
+| DeepSeek-V2-Lite | MLA | ✅ Validated (patch in `patches/`) |
+| GLM-5 sparse attention | Non-standard | ❌ Not supported |
 
-Models with non-standard attention (Qwen3.5's Gated DeltaNet, GLM-5's sparse attention) are not compatible.
+Any HuggingFace model that uses standard `past_key_values` and supports `output_hidden_states=True` should work. Qwen3.5 support required a one-line fix in `_past_length()` — see [`patches/QWEN35_VALIDATION.md`](patches/QWEN35_VALIDATION.md).
 
 ## Project structure
 

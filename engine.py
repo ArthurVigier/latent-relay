@@ -89,6 +89,17 @@ class LatentRelayEngine:
         if hasattr(self.model.config, "use_cache"):
             self.model.config.use_cache = True
 
+        # Detect hybrid architecture (Qwen3.5 GDN + full attention)
+        _text_cfg = getattr(self.model.config, 'text_config', self.model.config)
+        _layer_types = getattr(_text_cfg, 'layer_types', None)
+        if _layer_types:
+            _n_full = sum(1 for t in _layer_types if t == 'full_attention')
+            print(f"[Engine] Hybrid architecture: {len(_layer_types)} layers "
+                  f"({_n_full} full attention, {len(_layer_types) - _n_full} linear)")
+        _tied = getattr(_text_cfg, 'tie_word_embeddings', False)
+        if _tied:
+            print("[Engine] Tied embeddings: W_a ≈ I (realignment = normalisation only)")
+
         # Precompute W_a
         self._wa_matrix, self._target_norm = self._compute_wa()
         print(f"[Engine] W_a computed: {self._wa_matrix.shape}")
@@ -117,19 +128,22 @@ class LatentRelayEngine:
     @staticmethod
     def _past_length(past_kv) -> int:
         """Get sequence length from past_key_values.
-        
-        Handles both DynamicCache (transformers >= 4.36) and legacy tuple format.
+
+        Handles DynamicCache, Qwen3_5DynamicCache (hybrid GDN + full attention
+        where some key_cache entries are None), and legacy tuple format.
         """
         if past_kv is None:
             return 0
-        # DynamicCache: access key_cache list directly
-        if hasattr(past_kv, 'key_cache'):
-            if len(past_kv.key_cache) > 0:
-                return past_kv.key_cache[0].shape[-2]
-            return 0
-        # DynamicCache alternative API
+        # Prefer get_seq_length() — works for all Cache subclasses including
+        # hybrid models (Qwen3.5) where key_cache entries may be None.
         if hasattr(past_kv, 'get_seq_length'):
             return past_kv.get_seq_length()
+        # DynamicCache without get_seq_length: find first non-None key tensor.
+        if hasattr(past_kv, 'key_cache'):
+            for k in past_kv.key_cache:
+                if k is not None:
+                    return k.shape[-2]
+            return 0
         # Legacy tuple format: ((k, v), (k, v), ...)
         if isinstance(past_kv, (list, tuple)) and len(past_kv) > 0:
             return past_kv[0][0].shape[-2]
