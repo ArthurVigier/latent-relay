@@ -263,7 +263,7 @@ cd phase0 && python run_phase0.py --model Qwen/Qwen3-4B
 
 ## Security
 
-All code is validated with **[ai-rsk](https://github.com/Krigsexe/ai-rsk)** — a security gate for AI-generated code with three detection layers (static rules, Semgrep + Gitleaks + osv-scanner, project analysis).
+All code is tested with **[ai-rsk](https://github.com/Krigsexe/ai-rsk)** — a security gate for AI-generated code with three detection layers (static rules, Semgrep + Gitleaks + osv-scanner, project analysis).
 
 ```
 ai-rsk scan
