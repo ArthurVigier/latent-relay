@@ -111,7 +111,7 @@ class ServerConfig:
 
     # Maximum size (in bytes) for base64-encoded hidden state payloads.
     # Requests exceeding this are rejected with HTTP 413.
-    max_payload_bytes: int = 50 * 1024 * 1024  # 50 MB
+    max_payload_bytes: int = 200 * 1024 * 1024  # 200 MB
 
 
 @dataclass

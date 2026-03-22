@@ -35,4 +35,4 @@ concept_vectors:
 server:
   host: "0.0.0.0"
   port: 8001
-  max_payload_bytes: 52428800   # 50 MB — max size of base64 hidden state payloads
+  max_payload_bytes: 209715200  # 200 MB — max size of base64 hidden state payloads

@@ -67,7 +67,7 @@ _eris_bridge:   Optional[ERISBridge]       = None
 # ── Body-size guard (CWE-400) ──────────────────────────────────────────────────
 # Default: 50 MB — matches ERISConfig.max_payload_bytes.
 # Updated at startup once the config is loaded.
-_max_payload_bytes: int = 50 * 1024 * 1024
+_max_payload_bytes: int = 200 * 1024 * 1024
 
 
 @app.middleware("http")

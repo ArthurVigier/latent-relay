@@ -124,7 +124,7 @@ concept_vectors:
 server:
   host: "0.0.0.0"
   port: 8001
-  max_payload_bytes: 52428800  # 50 MB
+  max_payload_bytes: 209715200  # 200 MB
 ```
 
 All analyzer sections are optional — the server degrades gracefully when paths are `null`.
