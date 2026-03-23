@@ -3,7 +3,7 @@
 ERIS v5 — Phase 1 Complete Evaluation
 =======================================
 
-All Phase 1 tests in one file. Nine metrics, four categories:
+All Phase 1 tests in one file. Ten metrics, four categories:
 
   CHANNEL VALIDATION (no Claude API needed):
     m4        Projection fidelity — STS-B cosine vs human similarity
@@ -14,9 +14,12 @@ All Phase 1 tests in one file. Nine metrics, four categories:
     abc       A/B/C — Claude direct vs Claude+paraphrase vs Claude+ruminate
 
   STEERING & LOOPS:
-    steering  Contrastive Steering — extract concept vectors, test alignment
-    loop      Zombie↔Zombie autonomous exploration loop
-    dialogue  Claude↔Zombie dialogue — Claude IN the loop at every turn
+    steering      Contrastive Steering — extract concept vectors, test alignment
+    loop          Zombie↔Zombie autonomous exploration loop
+    dialogue      Claude↔Zombie dialogue — Claude IN the loop at every turn
+    steerdialogue Claude↔Zombie dialogue WITH contrastive steering at each turn:
+                  zombie ruminates toward a concept direction (rigorous, creative,
+                  cautious, concrete) — tracks whether Claude internalizes the direction
 
   FRONTIER (needs ANTHROPIC_API_KEY, uses web search):
     frontier  Claude vs Claude+Zombie on tasks requiring web + reasoning:
@@ -70,7 +73,11 @@ from tqdm import tqdm
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("eris_phase1")
 
-ALL_METRICS = {"m4", "m5", "m6", "abc", "steering", "loop", "dialogue", "frontier", "webdialogue"}
+ALL_METRICS = {
+    "m4", "m5", "m6", "abc",
+    "steering", "loop", "dialogue", "steerdialogue",
+    "frontier", "webdialogue",
+}
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -219,11 +226,11 @@ def load_technical_questions(n=50, seed=42):
     qs = []
     try:
         mmlu = load_dataset("TIGER-Lab/MMLU-Pro", split="test", trust_remote_code=True)
-        pool = [r for r in mmlu if r.get("category") in
-                ("computer_science", "engineering", "math", "physics",
-                 "biology", "chemistry", "philosophy", "economics")]
-        np.random.shuffle(pool)
-        for r in pool[:n // 2]:
+        pool_items = [r for r in mmlu if r.get("category") in
+                      ("computer_science", "engineering", "math", "physics",
+                       "biology", "chemistry", "philosophy", "economics")]
+        np.random.shuffle(pool_items)
+        for r in pool_items[:n // 2]:
             qs.append({"id": f"mmlu_{len(qs)}", "text": r["question"],
                        "source": "MMLU-Pro", "category": r.get("category", "?"),
                        "answer": r.get("answer")})
@@ -570,8 +577,7 @@ def eval_loop(client, n_seeds=5, n_iter=8, k=30, layer=9, hidden_dim=2560):
                 cum  = 0 if not vecs else 1 - cosine(v, vecs[0])
                 nov  = 1.0 if not vecs else 1 - max(cosine(v, p) for p in vecs)
                 vecs.append(v); texts.append(out)
-                iters.append({"step": step, "displacement": disp,
-                              "cumulative": cum, "novelty": nov})
+                iters.append({"step": step, "displacement": disp, "cumulative": cum, "novelty": nov})
                 cur = out
             except Exception as e:
                 log.warning(f"  step {step}: {e}"); break
@@ -824,15 +830,11 @@ def eval_frontier(client, n_steps=60):
             web_ctx = web_search_multi(search_queries)
             web_text = "\n\n".join(f"[{query}]\n{snip}" for query, snip in web_ctx.items())
 
-            # A: Claude alone
             text_a = ask([{"role": "user", "content": q}])
-
-            # B: Claude + web
             text_b = ask([{"role": "user",
                            "content": f"{q}\n\nHere is recent web research:\n{web_text}\n\n"
                                       f"Use this to give a thorough, evidence-based answer."}])
 
-            # C: Claude + web + zombie rumination
             bridge_r = client.bridge(text_b, mode="ruminate", n_steps=n_steps)
             enrichment = bridge_r.get("enriched_text", bridge_r.get("decoded_text", text_b))
             text_c = ask([
@@ -982,6 +984,214 @@ def eval_webdialogue(client, n_seeds=3, n_turns=6, k=30, layer=9, hidden_dim=256
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  STEERED DIALOGUE — Claude↔Zombie with contrastive steering vectors
+# ═══════════════════════════════════════════════════════════════════
+
+def _extract_steering_vectors(client, layer, hidden_dim, n_extract=30):
+    """Extract all 4 contrastive steering vectors. Returns {name: normalized_vec}."""
+    qs = load_technical_questions(n_extract)
+    q_texts = [q["text"] for q in qs]
+    vectors = {}
+    for name, tmpl in CONTRAST_TEMPLATES.items():
+        diffs = []
+        for q in tqdm(q_texts, desc=f"Extract {name}", leave=False):
+            try:
+                vp = extract_mean_vector(client.encode(tmpl["positive"] + q, layer=layer), hidden_dim)
+                vn = extract_mean_vector(client.encode(tmpl["negative"] + q, layer=layer), hidden_dim)
+                if vp is not None and vn is not None:
+                    diffs.append(vp - vn)
+            except Exception:
+                pass
+        if len(diffs) >= 10:
+            sv = np.mean(diffs, axis=0)
+            norm = np.linalg.norm(sv)
+            if norm > 1e-10:
+                vectors[name] = sv / norm
+                log.info(f"  {name}: {len(diffs)} pairs, |v|={norm:.4f}")
+    return vectors
+
+
+@dataclass
+class SteerDialogueResult:
+    seed_question: str
+    steering_concept: str
+    n_turns: int
+    k_per_turn: int
+    turns: list
+    # Claude evolution
+    claude_drift: float
+    claude_evolves: bool
+    # Steering persistence: does alignment with steering vector grow or decay?
+    alignment_trajectory: list  # cosine(claude_response_vec, steering_vec) per turn
+    alignment_trend: float      # slope of linear fit — positive = steering persists/amplifies
+    # Enrichment
+    enrichment_drift: float
+    mean_enrichment_novelty: float
+    convergence_turn: int
+    # Text
+    texts_claude: list
+    texts_enrichment: list
+
+    def summary(self):
+        ev = "🧠 evolves" if self.claude_evolves else "📍 static"
+        trend = ("📈 amplifies" if self.alignment_trend > 0.01
+                 else "📉 decays" if self.alignment_trend < -0.01
+                 else "→ stable")
+        cv = f"conv@{self.convergence_turn}" if self.convergence_turn >= 0 else "exploring"
+        lines = [
+            f"  [{self.steering_concept}] {ev} {trend} {cv}",
+            f"    c_drift={self.claude_drift:.4f} align_trend={self.alignment_trend:+.4f}",
+            f"    \"{self.seed_question[:60]}...\"",
+            f"    Alignment: {' → '.join(f'{a:.3f}' for a in self.alignment_trajectory)}",
+        ]
+        for t in self.turns:
+            lines.append(f"    turn {t['step']}: steer_align={t['steering_alignment']:.3f} "
+                         f"novel={t['enrichment_novelty']:.3f}")
+        return "\n".join(lines)
+
+
+def run_steered_dialogue(client, seed_question, steering_vec, steering_name,
+                         n_turns=6, k_per_turn=30, layer=9, hidden_dim=2560):
+    """Claude↔Zombie dialogue where the zombie is steered at each turn.
+
+    Turn 0: Claude answers
+            → zombie ruminates with steering concept prefix biasing the latent space
+            → enriched output reflects the steering direction
+    Turn N: Claude reads steered enrichment → responds
+            → zombie ruminates with same steering
+            → ...
+
+    Tracks: does the steering direction PERSIST in Claude's responses?
+    Does it amplify (Claude internalizes the direction) or decay (Claude resists)?
+    """
+    import anthropic
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        return None
+
+    cl = anthropic.Anthropic(api_key=key)
+    msgs, c_vecs, e_vecs, c_texts, e_texts, turns_data = [], [], [], [], [], []
+    align_trajectory = []
+
+    for turn in range(n_turns):
+        try:
+            # ── Claude's turn ──
+            if turn == 0:
+                msgs.append({"role": "user", "content": seed_question})
+            else:
+                msgs.append({"role": "user",
+                             "content": (f"Here's an alternative analysis from a parallel reasoning process:\n\n"
+                                         f"{e_texts[-1]}\n\n"
+                                         f"Integrate what's useful, challenge what's wrong, deepen your analysis.")})
+
+            resp = cl.messages.create(model="claude-sonnet-4-6", max_tokens=512,
+                                      messages=msgs, timeout=60)
+            c_text = resp.content[0].text
+            msgs.append({"role": "assistant", "content": c_text})
+            c_texts.append(c_text)
+
+            vc = extract_mean_vector(client.encode(c_text[:500], layer=layer), hidden_dim)
+            if vc is None:
+                break
+            c_vecs.append(vc)
+
+            # Measure Claude's alignment with the steering direction
+            steer_align = cosine(vc, steering_vec)
+            align_trajectory.append(steer_align)
+
+            # ── Zombie's steered turn ──
+            # Prepend the concept's positive prefix to bias the rumination direction
+            steered_input = (
+                f"{CONTRAST_TEMPLATES[steering_name]['positive']}\n"
+                f"{c_text}"
+            )
+            br = client.bridge(steered_input, mode="ruminate", n_steps=k_per_turn)
+            e_text = br.get("enriched_text", br.get("decoded_text", c_text))
+            if not e_text or len(e_text.strip()) < 10:
+                e_text = c_text
+            e_texts.append(e_text)
+
+            ve = extract_mean_vector(client.encode(e_text[:500], layer=layer), hidden_dim)
+            if ve is None:
+                break
+            e_vecs.append(ve)
+
+            c_disp = 0 if turn == 0 else 1 - cosine(vc, c_vecs[-2])
+            e_nov  = 1.0 if turn == 0 else 1 - max(cosine(ve, p) for p in e_vecs[:-1])
+
+            turns_data.append({
+                "step": turn,
+                "claude_text": c_text[:300],
+                "enrichment_text": e_text[:300],
+                "claude_displacement": c_disp,
+                "enrichment_novelty": e_nov,
+                "steering_alignment": steer_align,
+            })
+            time.sleep(0.5)
+        except Exception as e:
+            log.warning(f"  turn {turn}: {e}"); break
+
+    if len(c_vecs) < 2:
+        return None
+
+    cd = 1 - cosine(c_vecs[0], c_vecs[-1])
+    ed = 1 - cosine(e_vecs[0], e_vecs[-1])
+    novs = [t["enrichment_novelty"] for t in turns_data[1:]]
+    mn = float(np.mean(novs)) if novs else 0
+    cv = next((t["step"] for t in turns_data[1:] if t["enrichment_novelty"] < 0.05), -1)
+
+    # Linear trend of alignment_trajectory: positive = Claude increasingly aligns
+    if len(align_trajectory) >= 2:
+        x = np.arange(len(align_trajectory))
+        slope, _ = np.polyfit(x, align_trajectory, 1)
+        align_trend = float(slope)
+    else:
+        align_trend = 0.0
+
+    return SteerDialogueResult(
+        seed_question=seed_question[:100],
+        steering_concept=steering_name,
+        n_turns=len(turns_data),
+        k_per_turn=k_per_turn,
+        turns=turns_data,
+        claude_drift=cd,
+        claude_evolves=cd > 0.1,
+        alignment_trajectory=align_trajectory,
+        alignment_trend=align_trend,
+        enrichment_drift=ed,
+        mean_enrichment_novelty=mn,
+        convergence_turn=cv,
+        texts_claude=c_texts,
+        texts_enrichment=e_texts,
+    )
+
+
+def eval_steerdialogue(client, n_seeds=2, n_turns=6, k=30, layer=9, hidden_dim=2560, n_extract=30):
+    """Run steered Claude↔Zombie dialogue for each of the 4 concept directions."""
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        log.error("ANTHROPIC_API_KEY not set"); return []
+
+    log.info("Extracting steering vectors...")
+    steering_vecs = _extract_steering_vectors(client, layer, hidden_dim, n_extract)
+    if not steering_vecs:
+        log.error("No steering vectors extracted"); return []
+
+    seeds = load_seed_texts(n_seeds)
+    results = []
+
+    for i, seed in enumerate(seeds):
+        for concept_name, sv in steering_vecs.items():
+            log.info(f"SteerDialogue seed={i+1} concept={concept_name}")
+            r = run_steered_dialogue(client, seed, sv, concept_name,
+                                     n_turns, k, layer, hidden_dim)
+            if r is not None:
+                results.append(r)
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1024,15 +1234,18 @@ def main():
     try:
         if "m4" in metrics:
             log.info("═"*60 + "\n  M4 — Projection Fidelity\n" + "═"*60)
-            r = eval_m4(client, cfg, args.n_pairs); print(f"\n{r.summary()}\n"); R["m4"] = asdict(r)
+            r = eval_m4(client, cfg, args.n_pairs)
+            print(f"\n{r.summary()}\n"); R["m4"] = asdict(r)
 
         if "m5" in metrics:
             log.info("═"*60 + "\n  M5 — LatentMAS Gain\n" + "═"*60)
-            r = eval_m5(client, args.n_questions); print(f"\n{r.summary()}\n"); R["m5"] = asdict(r)
+            r = eval_m5(client, args.n_questions)
+            print(f"\n{r.summary()}\n"); R["m5"] = asdict(r)
 
         if "m6" in metrics:
             log.info("═"*60 + "\n  M6 — Implicit Features\n" + "═"*60)
-            r = eval_m6(client, min(20, args.n_questions)); print(f"\n{r.summary()}\n"); R["m6"] = asdict(r)
+            r = eval_m6(client, min(20, args.n_questions))
+            print(f"\n{r.summary()}\n"); R["m6"] = asdict(r)
 
         if "abc" in metrics:
             log.info("═"*60 + "\n  ABC — Claude A/B/C\n" + "═"*60)
@@ -1056,6 +1269,13 @@ def main():
             log.info("═"*60 + "\n  Claude↔Zombie Dialogue\n" + "═"*60)
             rs = eval_dialogue(client, args.n_seeds, args.n_turns, args.k_per_step, layer, hidden_dim)
             R["dialogue"] = [asdict(r) for r in rs]
+            for r in rs: print(r.summary())
+
+        if "steerdialogue" in metrics:
+            log.info("═"*60 + "\n  Steered Claude↔Zombie Dialogue\n" + "═"*60)
+            rs = eval_steerdialogue(client, min(2, args.n_seeds), args.n_turns,
+                                    args.k_per_step, layer, hidden_dim, args.n_extract)
+            R["steerdialogue"] = [asdict(r) for r in rs]
             for r in rs: print(r.summary())
 
         if "frontier" in metrics:
@@ -1105,6 +1325,12 @@ def main():
         rs = R["dialogue"]
         evolving = sum(1 for r in rs if r["claude_evolves"])
         print(f"  Dialogue:        {evolving}/{len(rs)} Claude instances evolving")
+    if "steerdialogue" in R:
+        rs = R["steerdialogue"]
+        amplifying = sum(1 for r in rs if r["alignment_trend"] > 0.01)
+        evolving   = sum(1 for r in rs if r["claude_evolves"])
+        print(f"  SteerDialogue:   {amplifying}/{len(rs)} amplifying, "
+              f"{evolving}/{len(rs)} evolving")
     if "frontier" in R:
         r = R["frontier"]
         print(f"  Frontier:        A={r['mean_a']:.2f} B={r['mean_b']:.2f} C={r['mean_c']:.2f}  "
