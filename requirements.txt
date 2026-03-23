@@ -28,6 +28,9 @@ anthropic>=0.40.0
 
 # Evaluation (eval/eval_phase1.py)
 datasets>=2.20.0
+scipy>=1.10.0
+tqdm>=4.0.0
+duckduckgo-search>=6.0.0   # frontier/webdialogue web search (no API key needed)
 
 # Testing
 pytest>=8.0.0
