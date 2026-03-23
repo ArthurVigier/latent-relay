@@ -610,7 +610,7 @@ def save_checkpoint(
 
     checkpoint = {"state_dict": state_dict, "cfg": cfg}
     ckpt_path  = output_dir / "sae_weights.pt"
-    torch.save(checkpoint, ckpt_path)
+    torch.save(checkpoint, ckpt_path)  # ai-rsk-ignore -- save-side only; loader (eris/analyzers.py) uses weights_only=True
     log.info(f"Saved checkpoint → {ckpt_path}")
 
     if labels:
