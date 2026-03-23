@@ -35,4 +35,7 @@ concept_vectors:
 server:
   host: "0.0.0.0"
   port: 8001
-  max_payload_bytes: 209715200  # 200 MB — max size of base64 hidden state payloads
+  max_payload_bytes: 2147483648      # 2 GB — covers multi-layer DeepSeek R1 responses
+  max_payload_warning_bytes: 524288000  # 500 MB — log warning above this
+  # For single-GPU setups with limited RAM, reduce max_payload_bytes to 524288000 (500 MB)
+  # and use single-layer-per-call encoding (eval_m4_diagnostic_v3 strategy).

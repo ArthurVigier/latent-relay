@@ -64,21 +64,69 @@ _eris_cfg:      Optional[ERISConfig]      = None
 _eris_registry: Optional[AnalyzerRegistry] = None
 _eris_bridge:   Optional[ERISBridge]       = None
 
-# ── Body-size guard (CWE-400) ──────────────────────────────────────────────────
-# Default: 50 MB — matches ERISConfig.max_payload_bytes.
-# Updated at startup once the config is loaded.
-_max_payload_bytes: int = 200 * 1024 * 1024
+# ── Response-size guard (CWE-400) ─────────────────────────────────────────────
+# Default: 2 GB — sized for multi-layer hidden states on DeepSeek R1 / Qwen3-32B.
+# Updated at startup once the ERIS config is loaded.
+_max_payload_bytes: int = 2_147_483_648        # 2 GB
+_max_payload_warn:  int = 524_288_000          # 500 MB — log warning above this
+
+import logging as _logging
+_eris_log = _logging.getLogger("eris")
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response as _StarletteResponse
 
 
-@app.middleware("http")
-async def _limit_body_size(request: Request, call_next):
-    content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > _max_payload_bytes:
-        return JSONResponse(
-            {"detail": f"Request body exceeds limit ({_max_payload_bytes} bytes)."},
-            status_code=413,
+class _ResponseSizeMiddleware(BaseHTTPMiddleware):
+    """Return HTTP 413 with a helpful body when a /v1/ response exceeds the limit."""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+
+        # Only enforce on ERIS endpoints — leave /health, /sessions, etc. alone.
+        if not request.url.path.startswith("/v1/"):
+            return response
+
+        # Consume the response body so we can measure it.
+        body_parts = []
+        async for chunk in response.body_iterator:
+            body_parts.append(chunk if isinstance(chunk, bytes) else chunk.encode())
+        body = b"".join(body_parts)
+        size = len(body)
+
+        if size > _max_payload_bytes:
+            _eris_log.error(
+                "Response too large: %s bytes (limit: %s) for %s. "
+                "Hint: use fewer return_layers, shorter text, or compact=true.",
+                f"{size:,}", f"{_max_payload_bytes:,}", request.url.path,
+            )
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "detail": f"Response too large: {size:,} bytes "
+                              f"(limit: {_max_payload_bytes:,} bytes).",
+                    "hint": "Use fewer return_layers, shorter input text, "
+                            "or set compact=true.",
+                    "response_bytes": size,
+                    "limit_bytes": _max_payload_bytes,
+                },
+            )
+
+        if size > _max_payload_warn:
+            _eris_log.warning(
+                "Large response: %s bytes for %s (warning threshold: %s)",
+                f"{size:,}", request.url.path, f"{_max_payload_warn:,}",
+            )
+
+        return _StarletteResponse(
+            content=body,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            media_type=response.media_type,
         )
-    return await call_next(request)
+
+
+app.add_middleware(_ResponseSizeMiddleware)
 
 
 @app.on_event("startup")
@@ -87,11 +135,14 @@ async def eris_startup() -> None:
     Second startup hook (runs after server.py's engine load).
     Initialises the ERIS config, analyzer registry, and bridge.
     """
-    global _eris_cfg, _eris_registry, _eris_bridge, _max_payload_bytes
+    global _eris_cfg, _eris_registry, _eris_bridge, _max_payload_bytes, _max_payload_warn
 
     config_path = os.environ.get("ERIS_CONFIG")
     _eris_cfg = ERISConfig.load(config_path)
     _max_payload_bytes = _eris_cfg.server.max_payload_bytes
+    _max_payload_warn = getattr(
+        _eris_cfg.server, "max_payload_warning_bytes", _max_payload_bytes // 4
+    )
     print(_eris_cfg.summary())
 
     _eris_registry = AnalyzerRegistry.from_config(_eris_cfg)

@@ -124,7 +124,7 @@ concept_vectors:
 server:
   host: "0.0.0.0"
   port: 8001
-  max_payload_bytes: 209715200  # 200 MB
+  max_payload_bytes: 2147483648  # 2 GB — sized for DeepSeek R1 multi-layer responses
 ```
 
 All analyzer sections are optional — the server degrades gracefully when paths are `null`.
@@ -309,6 +309,11 @@ The CI pipeline (`.github/workflows/test.yml`) runs `ai-rsk scan` as a gate befo
 - Small models (4B) struggle with OpenClaw's large system prompts (~58KB)
 - SAE and Â-hat analyzers require pre-trained checkpoints not included in this repo
 - Only tested on math reasoning tasks (GSM8K) for the base LatentMAS layer
+- Response size is limited to 2 GB by default (configurable in `eris_config.yaml`).
+  Multi-layer hidden state requests on large models (DeepSeek R1, Qwen3-32B) with
+  long sequences can produce responses exceeding 1 GB. The server returns HTTP 413
+  with a diagnostic message if the limit is exceeded. For single-GPU setups,
+  consider reducing to 500 MB and using single-layer-per-call encoding.
 
 ## Acknowledgments
 

@@ -110,8 +110,11 @@ class ServerConfig:
     port: int = 8001
 
     # Maximum size (in bytes) for base64-encoded hidden state payloads.
-    # Requests exceeding this are rejected with HTTP 413.
-    max_payload_bytes: int = 200 * 1024 * 1024  # 200 MB
+    # Responses exceeding this are rejected with HTTP 413.
+    max_payload_bytes: int = 2_147_483_648  # 2 GB — sized for multi-layer on DeepSeek R1
+
+    # Log a warning for responses above this threshold (even when under the limit).
+    max_payload_warning_bytes: int = 524_288_000  # 500 MB
 
 
 @dataclass
@@ -224,7 +227,10 @@ class ERISConfig:
             server=ServerConfig(
                 host=srv_d.get("host", "0.0.0.0"),
                 port=srv_d.get("port", 8001),
-                max_payload_bytes=srv_d.get("max_payload_bytes", 50 * 1024 * 1024),
+                max_payload_bytes=srv_d.get("max_payload_bytes", 2_147_483_648),
+                max_payload_warning_bytes=srv_d.get(
+                    "max_payload_warning_bytes", 524_288_000
+                ),
             ),
             default_n_steps=d.get("default_n_steps", 60),
         )
