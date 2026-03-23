@@ -229,6 +229,17 @@ eris/
   implicit_features.py     Implicit feature detection (SAE activations vs surface tokens)
   bridge.py                encode → analyze → think → decode pipeline
 
+eval/
+  eval_phase1_v1.py        Full phase 1 eval suite (M4–M6, ABC, steering, loop, dialogue, frontier, webdialogue)
+  train_sae.py             SAE trainer — collect hidden states via /v1/encode, train, save checkpoint
+  sae_autolabel_v2.py      Boundary-aware SAE feature auto-labelling (contrastive prompt + predictive validation)
+  eval_m4_diagnostic*.py   M4 diagnostic iterations (v1–v3, kept for reference)
+
+results/
+  phase1_channel_validation_20260323_151702.json   M4/M5/steering/loop — Qwen3.5-4B
+  phase1_extended_metrics_20260323_171027.json     M6/ABC/dialogue/steerdialogue/frontier/webdialogue — Qwen3.5-4B
+  phase1_qwen3-14b_20260322_162358.json            M4 only — Qwen3-14B (layer not tuned)
+
 configs/
   eris_config.yaml         Config template (null paths = graceful degradation)
   concept_vectors/         Reference concept vectors (.pt or .npy)
@@ -289,7 +300,7 @@ cd phase0 && python run_phase0.py --model Qwen/Qwen3-4B
 
 ### Phase 1 eval results (2026-03-23, RunPod H100, Qwen3.5-4B, layer 9)
 
-Raw results: [`results/phase1_channel_validation_20260323_151702.json`](results/phase1_channel_validation_20260323_151702.json) · [`results/phase1_extended_metrics_20260323_171027.json`](results/phase1_extended_metrics_20260323_171027.json)
+Raw results: [`results/phase1_channel_validation_20260323_151702.json`](results/phase1_channel_validation_20260323_151702.json) · [`results/phase1_extended_metrics_20260323_171027.json`](results/phase1_extended_metrics_20260323_171027.json) · [`results/phase1_qwen3-14b_20260322_162358.json`](results/phase1_qwen3-14b_20260322_162358.json)
 
 **Channel validation (M4, M5)**
 
@@ -301,6 +312,8 @@ Raw results: [`results/phase1_channel_validation_20260323_151702.json`](results/
 | M5 gain detected (latent displacement) | true | any gain | ✅ |
 
 M5 displacement increases from K=0 (156.2) → K=30 (160.3) then plateaus, confirming the latent channel carries information beyond the prompt.
+
+**Qwen3-14B (2026-03-22, M4 only):** Spearman=0.415, `pass_threshold=false`. Run at default layer without tuning — mean cosine similarity 0.942 (high) but correlation with human judgements is weak. Layer selection matters: Qwen3-14B has 40 layers vs 4B's 28; layer 9 is proportionally too early. A sweep around layer 18–22 is the correct next step before drawing conclusions on 14B.
 
 **Concept steering**
 
@@ -319,7 +332,7 @@ M5 displacement increases from K=0 (156.2) → K=30 (160.3) then plateaus, confi
 
 **Implicit features (M6)**
 
-SAE available. Mean implicit features active per question: **20.0** (mean total surface tokens with matching features: 0.0). Implicit ratio: 20.0 — all detected features are latent-only, not surfaced in the text. Labels are null (auto-labelling not yet run).
+SAE available. Mean implicit features active per question: **20.0** (mean total surface tokens with matching features: 0.0). Implicit ratio: 20.0 — all detected features are latent-only, not surfaced in the text. Feature labels are `null` — auto-labelling has not been run yet. To label: `ANTHROPIC_API_KEY=sk-... python eval/train_sae.py --layer 9 --auto-label` (or run `eval/sae_autolabel_v2.py` standalone on the checkpoint). Labels unlock semantic interpretation of which concepts each implicit feature tracks.
 
 **Response quality (ABC)**
 

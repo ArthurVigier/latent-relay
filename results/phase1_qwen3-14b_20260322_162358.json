@@ -1,0 +1,13 @@
+{
+  "tag": "qwen3-14b",
+  "timestamp": "2026-03-22 16:23:29",
+  "m4": {
+    "spearman_r": 0.4152670184006593,
+    "spearman_p": 9.697699170960895e-10,
+    "pearson_r": 0.3517610323030082,
+    "pearson_p": 3.2618417654277615e-07,
+    "n_pairs": 200,
+    "mean_cosine": 0.9418928804993629,
+    "pass_threshold": false
+  }
+}
