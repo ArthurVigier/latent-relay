@@ -749,20 +749,33 @@ def main():
     cache_dir  = Path(args.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    cache_path = cache_dir / f"hidden_states_layer{args.layer}_{safe_model}_{args.n_texts}.npy"
-    if args.force_collect and cache_path.exists():
-        cache_path.unlink()
-        log.info("Deleted old cache")
-
     # ── Phase 1: Collect ──
     log.info("="*60 + "\nPhase 1: Collecting hidden states\n" + "="*60)
     texts = _build_corpus(args.n_texts, args.seed)
     log.info(f"  Corpus: {len(texts)} texts")
 
-    data = collect_hidden_states(
-        client, texts, args.layer, cache_path,
-        hidden_dim, max_seq_len=args.max_seq_len,
-    )
+    # Use boundary-aware collection (saves token→text map for v2 auto-labelling)
+    try:
+        from sae_autolabel_v2 import collect_hidden_states_with_boundaries
+        data, boundaries, valid_texts = collect_hidden_states_with_boundaries(
+            client, texts, args.layer, cache_dir,
+            hidden_dim, max_seq_len=args.max_seq_len,
+            force=args.force_collect,
+        )
+        _boundaries = boundaries
+        _valid_texts = valid_texts
+    except ImportError:
+        # Fallback to original collection if sae_autolabel_v2 not available
+        cache_path = cache_dir / f"hidden_states_layer{args.layer}_{safe_model}_{args.n_texts}.npy"
+        if args.force_collect and cache_path.exists():
+            cache_path.unlink()
+        data = collect_hidden_states(
+            client, texts, args.layer, cache_path,
+            hidden_dim, max_seq_len=args.max_seq_len,
+        )
+        _boundaries = None
+        _valid_texts = texts
+
     client.close()
     log.info(f"  Dataset: {data.shape[0]:,} token vectors × {data.shape[1]} dims")
 
@@ -817,7 +830,20 @@ def main():
     labels = {}
     if args.auto_label:
         log.info("="*60 + "\nPhase 3: Auto-labelling features\n" + "="*60)
-        labels = auto_label_features(sae, train_data, texts)
+        if _boundaries is not None:
+            try:
+                from sae_autolabel_v2 import auto_label_features_v2, save_labels
+                feature_labels = auto_label_features_v2(
+                    sae, data, _boundaries, _valid_texts, device=args.device,
+                )
+                labels = {str(l.feature_idx): l.label for l in feature_labels}
+                # Also save the full quality report alongside the checkpoint
+                from pathlib import Path as _Path
+                save_labels(feature_labels, output_dir / "feature_labels.json")
+            except ImportError:
+                labels = auto_label_features(sae, train_data, _valid_texts)
+        else:
+            labels = auto_label_features(sae, train_data, _valid_texts)
 
     # ── Save ──
     log.info("="*60 + "\nSaving checkpoint\n" + "="*60)
