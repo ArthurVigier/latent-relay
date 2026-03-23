@@ -287,6 +287,76 @@ cd phase0 && python run_phase0.py --model Qwen/Qwen3-4B
 - `collaborate()` passes accumulated KV-cache into `generate()` — latent context now influences final generation
 - Qwen3.5 hybrid GDN architecture supported (18 linear + 6 full attention layers)
 
+### Phase 1 eval results (2026-03-23, RunPod H100, Qwen3.5-4B, layer 9)
+
+Raw results: [`results/phase1_channel_validation_20260323_151702.json`](results/phase1_channel_validation_20260323_151702.json) · [`results/phase1_extended_metrics_20260323_171027.json`](results/phase1_extended_metrics_20260323_171027.json)
+
+**Channel validation (M4, M5)**
+
+| Metric | Result | Threshold | Pass |
+|---|---|---|---|
+| M4 Spearman r (semantic preservation) | 0.608 | ≥ 0.6 | ✅ |
+| M4 Pearson r | 0.599 | — | — |
+| M4 mean cosine similarity | 0.523 | — | — |
+| M5 gain detected (latent displacement) | true | any gain | ✅ |
+
+M5 displacement increases from K=0 (156.2) → K=30 (160.3) then plateaus, confirming the latent channel carries information beyond the prompt.
+
+**Concept steering**
+
+| Concept | Positive rate | Alignment mean |
+|---|---|---|
+| rigorous_vs_superficial | 1.00 | 0.136 |
+| creative_vs_conventional | 1.00 | 0.225 |
+| cautious_vs_confident | 0.90 | 0.068 |
+| concrete_vs_abstract | 0.30 | −0.011 |
+
+3/4 concepts steer reliably (≥ 0.9). `concrete_vs_abstract` fails — the concept vector may not be well-separated in Qwen3.5-4B's representation space at layer 9.
+
+**Loop stability (M5 extended)**
+
+5 seeds × 8 iterations (K=30 per step). Total drift: 0.120 / 0.167 / 0.342 across 3 reported seeds. No divergence observed; the loop is stable.
+
+**Implicit features (M6)**
+
+SAE available. Mean implicit features active per question: **20.0** (mean total surface tokens with matching features: 0.0). Implicit ratio: 20.0 — all detected features are latent-only, not surfaced in the text. Labels are null (auto-labelling not yet run).
+
+**Response quality (ABC)**
+
+30 questions evaluated by Claude. A = base Qwen3.5-4B, B = raw enrichment, C = bridge (Claude+Zombie).
+
+| | Mean score | vs A win rate | vs B win rate |
+|---|---|---|---|
+| A (base) | 2.77 | — | — |
+| B (enrichment) | 2.33 | — | — |
+| C (bridge) | **3.57** | 0.50 | **0.73** (p=7×10⁻⁵) |
+
+C consistently outperforms B (Wilcoxon p < 0.001). C vs A is borderline (p=0.007, win rate 0.50) — C scores higher on average but doesn't win on every question. Bridge output is not uniformly better than base; it adds value on complex reasoning but sometimes introduces noise on simple questions.
+
+**Dialogue evolution**
+
+3 seeds × 6 turns. Claude drift: 0.148 / 0.164 / 0.172 (all seeds show evolution). No convergence detected (`convergence_turn = -1` for all) — Claude's responses keep shifting throughout the dialogue rather than locking in. Prompt injection resistance observed at turn 3 and 5 (Claude named and refused embedded format override instructions).
+
+**Steered dialogue**
+
+8 runs (4 concepts × 2 seeds). Claude drift: 0.097–0.212. Alignment trends range −0.025 to +0.019 — steering effect on multi-turn alignment is weak and concept-dependent. Convergence faster than plain dialogue (median at turn 2–4).
+
+**Frontier tasks**
+
+5 hard research questions. A = base Claude, B = Claude with web search, C = bridge (Claude+Zombie).
+
+| | Mean score |
+|---|---|
+| A (base Claude) | 6.0 / 6 |
+| B (Claude + web) | 6.0 / 6 |
+| C (bridge) | 4.8 / 6 |
+
+Base Claude and Claude+web tie at ceiling. Bridge (C) underperforms — the zombie model's latent context degrades Claude's output on frontier tasks requiring current knowledge and precise factual claims. Web search didn't help either (searches returned no results for most queries).
+
+**Web-grounded dialogue**
+
+3 seeds × 6 turns. Claude drift: 0.159 / 0.250 / 0.245. Prompt injection resistance confirmed in all seeds.
+
 ## Security
 
 All code is tested with **[ai-rsk](https://github.com/Krigsexe/ai-rsk)** — a security gate for AI-generated code with three detection layers (static rules, Semgrep + Gitleaks + osv-scanner, project analysis).
