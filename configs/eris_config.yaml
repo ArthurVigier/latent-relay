@@ -31,6 +31,15 @@ concept_vectors:
   # File stem is used as the concept name: "game_theory.pt" → "game_theory"
   vectors_dir: "configs/concept_vectors"
 
+# ── Generation (zombie collaborate() step) ───────────────────────────────────
+generation:
+  # Disable chain-of-thought / thinking mode for the zombie.
+  # Qwen3.x models support enable_thinking=False + thinking_budget=0.
+  # Eliminates <think> blocks and reduces adversarial meta-discourse in output.
+  enable_thinking: false
+  temperature: 0.7
+  top_p: 0.95
+
 # ── HTTP server ──────────────────────────────────────────────────────────────
 server:
   host: "0.0.0.0"

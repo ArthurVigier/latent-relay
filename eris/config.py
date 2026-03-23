@@ -103,6 +103,20 @@ class ConceptVectorsConfig:
 
 
 @dataclass
+class GenerationConfig:
+    """Generation settings for the zombie model's collaborate() step."""
+
+    # Set to False to disable chain-of-thought / thinking mode on models that
+    # support it (Qwen3.x, etc.).  In thinking mode the zombie generates
+    # <think>...</think> meta-discourse that inflates token count and can
+    # contain adversarial content — disabling it produces cleaner enrichments.
+    enable_thinking: bool = False
+
+    temperature: float = 0.7
+    top_p: float = 0.95
+
+
+@dataclass
 class ServerConfig:
     """HTTP server settings for eris_server.py."""
 
@@ -138,6 +152,9 @@ class ERISConfig:
     sae: SAEConfig = field(default_factory=SAEConfig)
     a_hat: AHatConfig = field(default_factory=AHatConfig)
     concept_vectors: ConceptVectorsConfig = field(default_factory=ConceptVectorsConfig)
+
+    # ── Generation ───────────────────────────────────────────────────────────
+    generation: GenerationConfig = field(default_factory=GenerationConfig)
 
     # ── Server ───────────────────────────────────────────────────────────────
     server: ServerConfig = field(default_factory=ServerConfig)
@@ -203,6 +220,7 @@ class ERISConfig:
         sae_d = _get("sae")
         a_hat_d = _get("a_hat")
         cv_d = _get("concept_vectors")
+        gen_d = _get("generation")
         srv_d = _get("server")
 
         return cls(
@@ -223,6 +241,11 @@ class ERISConfig:
                     "vectors_dir",
                     str(Path(__file__).parent.parent / "configs" / "concept_vectors"),
                 )
+            ),
+            generation=GenerationConfig(
+                enable_thinking=gen_d.get("enable_thinking", False),
+                temperature=gen_d.get("temperature", 0.7),
+                top_p=gen_d.get("top_p", 0.95),
             ),
             server=ServerConfig(
                 host=srv_d.get("host", "0.0.0.0"),

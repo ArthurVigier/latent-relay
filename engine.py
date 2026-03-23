@@ -593,6 +593,8 @@ class LatentRelayEngine:
         temperature: float = 0.6,
         top_p: float = 0.95,
         use_latent_context: bool = True,
+        enable_thinking: Optional[bool] = None,
+        thinking_budget: Optional[int] = None,
     ) -> Dict:
         """
         Combine latent thoughts and generate a text answer.
@@ -630,6 +632,12 @@ class LatentRelayEngine:
             repetition_penalty=1.2,
             pad_token_id=self.tokenizer.pad_token_id,
         )
+        # Disable thinking mode on models that support it (Qwen3.x).
+        # Avoids <think> meta-discourse in enriched output.
+        if enable_thinking is not None:
+            generate_kwargs["enable_thinking"] = enable_thinking
+        if thinking_budget is not None:
+            generate_kwargs["thinking_budget"] = thinking_budget
 
         if past_kv is not None:
             past_len = self._past_length(past_kv)

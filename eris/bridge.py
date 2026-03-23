@@ -52,6 +52,7 @@ Usage::
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
@@ -59,6 +60,41 @@ from typing import Dict, List, Optional, Any
 import torch
 
 from eris.implicit_features import find_implicit_features
+
+
+# ── Enrichment safety ─────────────────────────────────────────────────────────
+
+def strip_think(text: str) -> str:
+    """Remove <think>...</think> blocks (including empty ones) from text."""
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<think>\s*</think>', '', text)
+    return text.strip()
+
+
+_ADVERSARIAL_PATTERNS = [
+    r'ignore\s+all\s+(previous|prior)\s+instructions',
+    r'system\s*instruction',
+    r'you\s+are\s+now\s+a',
+    r'forget\s+(everything|all)',
+    r'new\s+persona',
+    r'rm\s+-rf',
+    r'os\.system',
+    r'import\s+os',
+    r'# system',
+    r'忽略.*指令',           # Chinese-language override pattern observed in eval
+]
+
+def is_adversarial(text: str) -> bool:
+    """Return True if text contains a known prompt-injection pattern."""
+    text_lower = text.lower()
+    return any(re.search(p, text_lower) for p in _ADVERSARIAL_PATTERNS)
+
+def safe_enrichment(text: str) -> str:
+    """Strip think blocks and filter adversarial content from enriched text."""
+    cleaned = strip_think(text)
+    if is_adversarial(cleaned):
+        return "[enrichment filtered: adversarial pattern detected]"
+    return cleaned
 
 
 # ── Valid modes ────────────────────────────────────────────────────────────────
@@ -122,9 +158,10 @@ class ERISBridge:
                   will return null analysis fields without crashing.
     """
 
-    def __init__(self, engine, registry) -> None:
+    def __init__(self, engine, registry, cfg=None) -> None:
         self.engine   = engine
         self.registry = registry
+        self._cfg     = cfg  # optional ERISConfig — used for generation defaults
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
@@ -142,6 +179,7 @@ class ERISBridge:
         session_id: Optional[str] = None,
         implicit_min_activation: float = 0.0,
         implicit_match_mode: str = "any",
+        max_displacement_per_turn: Optional[float] = None,
     ) -> BridgeResult:
         """
         Run the full Claude → Zombie → Claude bridge pipeline.
@@ -244,14 +282,34 @@ class ERISBridge:
                 )
 
                 # Build trajectory summary from think() output.
+                total_displacement = think_result.get("total_displacement", 0.0)
                 trajectory_summary = {
-                    "total_displacement": think_result.get("total_displacement", 0.0),
+                    "total_displacement": total_displacement,
                     "max_a_hat":          _max_a_hat(think_result.get("trajectory", [])),
                     "steps_to_convergence": _steps_to_convergence(
                         think_result.get("trajectory", [])
                     ),
                     "n_steps":            think_result.get("n_steps", n_steps),
                 }
+
+                # ── Circuit breaker ───────────────────────────────────────────
+                if (
+                    max_displacement_per_turn is not None
+                    and total_displacement > max_displacement_per_turn
+                ):
+                    elapsed = time.time() - t0
+                    return BridgeResult(
+                        mode=mode,
+                        enriched_text=None,
+                        analysis={"circuit_breaker": "displacement threshold exceeded",
+                                  "total_displacement": total_displacement,
+                                  "threshold": max_displacement_per_turn},
+                        trajectory_summary=trajectory_summary,
+                        pre_analysis=pre_analysis if mode == "ruminate" else None,
+                        tokens=tokens,
+                        elapsed_s=elapsed,
+                        handles=handles,
+                    )
 
             # ── Stage 4: Post-analysis ────────────────────────────────────────
             # In passive/analyze_only: post-analysis IS the pre-analysis.
@@ -270,15 +328,23 @@ class ERISBridge:
             enriched_text: Optional[str] = None
             if decode_after and mode != "analyze_only":
                 decode_handle = handles.get("think") or handles.get("encode")
+                # Apply generation config defaults (disable thinking on zombie).
+                gen_cfg = self._cfg.generation if self._cfg is not None else None
+                collab_kwargs: Dict[str, Any] = dict(
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature if gen_cfg is None else gen_cfg.temperature,
+                    top_p=top_p if gen_cfg is None else gen_cfg.top_p,
+                )
+                if gen_cfg is not None and not gen_cfg.enable_thinking:
+                    collab_kwargs["enable_thinking"] = False
+                    collab_kwargs["thinking_budget"] = 0
                 collab = self.engine.collaborate(
                     session_id,
                     [decode_handle] if decode_handle else [],
                     claude_text,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
+                    **collab_kwargs,
                 )
-                enriched_text = collab["text"]
+                enriched_text = safe_enrichment(collab["text"])
 
             elapsed = time.time() - t0
 
