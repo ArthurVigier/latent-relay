@@ -17,9 +17,10 @@ Usage::
     coord = create_coordinator(cfg.get("multi_agent", {}), probe)
 
 Supported orchestrator backends:
-    - "claude"  → ClaudeOrchestrator
-    - "gemini"  → GeminiOrchestrator  (stub — raises NotImplementedError)
-    - "openai"  → OpenAIOrchestrator  (stub — raises NotImplementedError)
+    - "claude"       → ClaudeOrchestrator
+    - "gemini"       → GeminiOrchestrator
+    - "openai"       → OpenAIOrchestrator  (stub — raises NotImplementedError)
+    - "openrouter"   → OpenRouterOrchestrator  (any model slug from openrouter.ai/models)
 
 Supported probe backends:
     - "hf"    → HFProbe (locally-loaded HuggingFace model)
@@ -69,9 +70,20 @@ def create_orchestrator(cfg: dict) -> OrchestratorLLM:
         from eris.backends.orchestrators.openai_orchestrator import OpenAIOrchestrator
         return OpenAIOrchestrator(**cfg)
 
+    if backend == "openrouter":
+        from eris.backends.orchestrators.openrouter_orchestrator import OpenRouterOrchestrator
+        kwargs = {}
+        for key in (
+            "model", "max_tokens", "api_key", "site_url", "site_name",
+            "provider_order", "fallbacks", "transforms", "require_params", "extra_headers",
+        ):
+            if key in cfg:
+                kwargs[key] = cfg[key]
+        return OpenRouterOrchestrator(**kwargs)
+
     raise ValueError(
         f"Unknown orchestrator backend: {backend!r}. "
-        "Supported: 'claude', 'gemini', 'openai'."
+        "Supported: 'claude', 'gemini', 'openai', 'openrouter'."
     )
 
 

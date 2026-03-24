@@ -48,6 +48,21 @@ backends:
     max_tokens: 2048
     # api_key: null   # reads ANTHROPIC_API_KEY from environment if not set
 
+    # ── OpenRouter alternative (comment out claude block above, uncomment below) ──
+    # backend: "openrouter"
+    # model: "openrouter/auto"           # auto-route to cheapest capable model
+    # model: "anthropic/claude-opus-4"   # specific model via OpenRouter
+    # model: "google/gemini-2.5-pro"
+    # model: "meta-llama/llama-3.3-70b-instruct:free"
+    # model: "deepseek/deepseek-r1"
+    # api_key: null                      # reads OPENROUTER_API_KEY from environment
+    # site_url: "https://github.com/ArthurVigier/latent-relay"
+    # site_name: "latent-relay / ERIS"
+    # provider_order: []                 # e.g. ["Anthropic", "AWS Bedrock"]
+    # fallbacks: []                      # e.g. ["openrouter/auto"]
+    # transforms: []                     # ["middle-out"] for long-context compression
+    # max_tokens: 2048
+
   probe:
     backend: "hf"
     model_id: "Qwen/Qwen3-14B"   # or "Qwen/Qwen3-32B", "deepseek-ai/DeepSeek-V2-Lite"
