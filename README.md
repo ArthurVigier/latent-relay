@@ -633,7 +633,7 @@ Claude named and refused each attempt in real time. All turn gains recorded as 0
 
 ## Security
 
-Scanned with [ai-rsk](https://github.com/Krigsexe/ai-rsk): **PASS 99/100**, 0 BLOCK findings. `weights_only=True` enforced on all `torch.load` calls. CI gate runs `ai-rsk scan` before tests.
+Scanned with [ai-rsk](https://github.com/Krigsexe/ai-rsk):  `weights_only=True` enforced on all `torch.load` calls. CI gate runs `ai-rsk scan` before tests.
 
 ---
 
