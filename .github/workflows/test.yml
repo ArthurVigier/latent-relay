@@ -26,7 +26,7 @@ jobs:
         # On scanne AVANT l'installation pour éviter les fichiers temporaires de pip
         run: |
           cargo install --git https://github.com/Krigsexe/ai-rsk --quiet
-          ai-rsk scan
+          ai-rsk scan --lockfile uv.lock
         env:
           CARGO_NET_RETRY: "3"
 
