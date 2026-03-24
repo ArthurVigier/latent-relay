@@ -22,8 +22,7 @@ jobs:
           cache: "pip"
 
       - name: Clean up obsolete artifacts
-        # On supprime ce vieux fichier qui fait planter le scanner (s'il est présent)
-        run: rm -f transformers-stream-generator-0.0.5.tar.gz
+        run: find . -name "*.tar.gz" -type f -delete
 
       - name: Install dependencies
         run: pip install -r requirements.txt
