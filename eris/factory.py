@@ -122,8 +122,8 @@ def create_probe(cfg: dict) -> ProbeModel:
             "model_id": cfg["model_id"],
             "layers":   cfg["layers"],
         }
-        if "device" in cfg:
-            kwargs["device"] = cfg["device"]
+        if "device"      in cfg: kwargs["device"]      = cfg["device"]
+        if "library_dir" in cfg: kwargs["library_dir"] = cfg["library_dir"]
         if "dtype" in cfg and cfg["dtype"] in dtype_map:
             kwargs["dtype"] = dtype_map[cfg["dtype"]]
         return HFProbe(**kwargs)

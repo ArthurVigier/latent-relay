@@ -23,8 +23,11 @@ Design constraints (hard):
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import time
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -34,7 +37,14 @@ from eris.interfaces import ProbeModel
 
 log = logging.getLogger("eris.hf_probe")
 
-_VALID_MODES = {"add", "project_out", "replace"}
+_VALID_MODES   = {"add", "project_out", "replace"}
+_MANIFEST_FILE = "manifest.json"
+
+
+def _sanitize_filename(name: str) -> str:
+    """Convert an arbitrary direction name into a safe filename stem."""
+    safe = re.sub(r"[^\w\-]", "_", name).strip("_")
+    return safe or "direction"
 
 
 class HFProbe(ProbeModel):
@@ -55,10 +65,12 @@ class HFProbe(ProbeModel):
         layers: list[int],
         device: str = "cuda",
         dtype: Optional[torch.dtype] = None,
+        library_dir: str = "steering_library",
     ) -> None:
         self.model_id = model_id
         self._requested_layers = layers
         self.device = device if torch.cuda.is_available() else "cpu"
+        self.library_dir = Path(library_dir)
 
         if dtype is None:
             self.dtype = torch.bfloat16 if "cuda" in self.device else torch.float32
@@ -70,9 +82,11 @@ class HFProbe(ProbeModel):
         self._tokenizer, self._model, self.n_layers = self._load_model()
         self.layers = self._resolve_layers(self._requested_layers)
         self._steering_library: dict[str, np.ndarray] = {}
+        self._load_library_from_disk()
         log.info(
-            "HFProbe ready: %s | %d layers | resolved=%s | %.1fs",
+            "HFProbe ready: %s | %d layers | resolved=%s | %.1fs | directions=%d",
             model_id, self.n_layers, self.layers, time.time() - t0,
+            len(self._steering_library),
         )
 
     # ── ProbeModel interface ────────────────────────────────────────────────────
@@ -148,13 +162,23 @@ class HFProbe(ProbeModel):
         )
 
     def save_direction(self, name: str, vector: np.ndarray) -> None:
-        """Save a named steering direction to the in-memory library."""
-        self._steering_library[name] = np.array(vector, dtype=np.float32)
-        log.debug("Saved steering direction: %r (dim=%d)", name, len(vector))
+        """
+        Save a named steering direction to memory and to disk.
+
+        Persists to ``{library_dir}/{sanitized_name}.npy`` and updates
+        ``{library_dir}/manifest.json``.  Survives process restarts.
+        """
+        arr = np.array(vector, dtype=np.float32)
+        self._steering_library[name] = arr
+        self._save_direction_to_disk(name, arr)
+        log.info("Saved steering direction: %r (dim=%d) → %s", name, len(arr), self.library_dir)
 
     def load_direction(self, name: str) -> np.ndarray:
         """
-        Load a named steering direction from the library.
+        Load a named steering direction from memory.
+
+        All persisted directions are loaded automatically at startup, so
+        this always reflects the on-disk state.
 
         Raises:
             KeyError: If the direction is not in the library.
@@ -166,9 +190,93 @@ class HFProbe(ProbeModel):
             )
         return self._steering_library[name].copy()
 
+    def delete_direction(self, name: str) -> None:
+        """
+        Remove a steering direction from memory and from disk.
+
+        Raises:
+            KeyError: If the direction is not in the library.
+        """
+        if name not in self._steering_library:
+            raise KeyError(f"Steering direction {name!r} not found.")
+        del self._steering_library[name]
+        self._delete_direction_from_disk(name)
+        log.info("Deleted steering direction: %r", name)
+
     def list_directions(self) -> list[str]:
         """Return the names of all saved steering directions."""
         return list(self._steering_library.keys())
+
+    # ── Persistence helpers ──────────────────────────────────────────────────
+
+    def _manifest_path(self) -> Path:
+        return self.library_dir / _MANIFEST_FILE
+
+    def _read_manifest(self) -> dict[str, str]:
+        """Return the manifest dict {name: filename} or {} if missing."""
+        p = self._manifest_path()
+        if not p.exists():
+            return {}
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            log.warning("Could not read manifest %s: %s", p, e)
+            return {}
+
+    def _write_manifest(self, manifest: dict[str, str]) -> None:
+        self._manifest_path().write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def _load_library_from_disk(self) -> None:
+        """Load all persisted directions into memory at startup."""
+        if not self.library_dir.exists():
+            return
+        manifest = self._read_manifest()
+        loaded = 0
+        for name, filename in manifest.items():
+            npy_path = self.library_dir / filename
+            if not npy_path.exists():
+                log.warning("Direction %r listed in manifest but file missing: %s", name, npy_path)
+                continue
+            try:
+                self._steering_library[name] = np.load(str(npy_path)).astype(np.float32)
+                loaded += 1
+            except Exception as e:
+                log.warning("Failed to load direction %r from %s: %s", name, npy_path, e)
+        if loaded:
+            log.info("Loaded %d steering direction(s) from %s", loaded, self.library_dir)
+
+    def _save_direction_to_disk(self, name: str, arr: np.ndarray) -> None:
+        self.library_dir.mkdir(parents=True, exist_ok=True)
+        manifest = self._read_manifest()
+
+        # Reuse existing filename if name already persisted, else create new.
+        if name in manifest:
+            filename = manifest[name]
+        else:
+            stem = _sanitize_filename(name)
+            # Avoid collisions: append suffix if stem already used by another name.
+            existing_files = set(manifest.values())
+            filename = f"{stem}.npy"
+            counter = 1
+            while filename in existing_files:
+                filename = f"{stem}_{counter}.npy"
+                counter += 1
+
+        np.save(str(self.library_dir / filename), arr)
+        manifest[name] = filename
+        self._write_manifest(manifest)
+
+    def _delete_direction_from_disk(self, name: str) -> None:
+        manifest = self._read_manifest()
+        filename = manifest.pop(name, None)
+        if filename:
+            npy_path = self.library_dir / filename
+            if npy_path.exists():
+                npy_path.unlink()
+        self._write_manifest(manifest)
 
     # ── Internal ────────────────────────────────────────────────────────────────
 

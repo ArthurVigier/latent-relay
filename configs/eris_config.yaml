@@ -69,6 +69,7 @@ backends:
     layers: [9, 18]
     device: "cuda:0"
     dtype: "bfloat16"            # "bfloat16" | "float32" | "float16"
+    library_dir: "steering_library"  # persisted steering vectors — survives restarts
 
 # ── Multi-agent coordination (used by eris/factory.py create_coordinator) ────
 multi_agent:

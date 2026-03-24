@@ -79,14 +79,16 @@ class LatentProbe(ProbeModel):
     while the actual logic lives in eris/backends/probes/hf_probe.py.
 
     Args:
-        model_id: HuggingFace model name or local path.
-        layers:   List of layer indices to extract.  Negative indices are
-                  resolved against the actual number of layers at load time.
-                  Layer -1 = last hidden layer.
-        device:   Torch device string.  Defaults to "cuda" if available,
-                  falls back to "cpu".
-        dtype:    Torch dtype for model weights.  Defaults to bfloat16 on
-                  CUDA, float32 on CPU.
+        model_id:     HuggingFace model name or local path.
+        layers:       List of layer indices to extract.  Negative indices are
+                      resolved against the actual number of layers at load time.
+                      Layer -1 = last hidden layer.
+        device:       Torch device string.  Defaults to "cuda" if available,
+                      falls back to "cpu".
+        dtype:        Torch dtype for model weights.  Defaults to bfloat16 on
+                      CUDA, float32 on CPU.
+        library_dir:  Directory where steering vectors are persisted.
+                      Defaults to "steering_library/".  Created automatically.
     """
 
     def __init__(
@@ -95,9 +97,13 @@ class LatentProbe(ProbeModel):
         layers: list[int],
         device: str = "cuda",
         dtype: Optional[torch.dtype] = None,
+        library_dir: str = "steering_library",
     ) -> None:
         from eris.backends.probes.hf_probe import HFProbe
-        self._backend = HFProbe(model_id=model_id, layers=layers, device=device, dtype=dtype)
+        self._backend = HFProbe(
+            model_id=model_id, layers=layers, device=device, dtype=dtype,
+            library_dir=library_dir,
+        )
 
         # Expose attributes callers depend on.
         self.model_id = self._backend.model_id
@@ -165,6 +171,10 @@ class LatentProbe(ProbeModel):
     def list_directions(self) -> list[str]:
         """Return the names of all saved steering directions."""
         return self._backend.list_directions()
+
+    def delete_direction(self, name: str) -> None:
+        """Remove a steering direction from memory and from disk."""
+        self._backend.delete_direction(name)
 
     def __repr__(self) -> str:
         return (
