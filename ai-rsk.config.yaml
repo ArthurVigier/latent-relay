@@ -2,7 +2,7 @@
 # Documentation: https://github.com/Krigsexe/ai-rsk
 
 # Timeout in seconds for external tool execution
-tool_timeout_seconds: 120
+tool_timeout_seconds: 500
 
 # Rules to disable (each requires a justification)
 # disabled_rules:
