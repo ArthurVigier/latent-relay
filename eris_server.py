@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from typing import Any, Dict, List, Optional, Union
 
 import torch
@@ -558,6 +559,107 @@ async def v1_bridge(req: BridgeRequest):
         return result.to_dict()
     except ValueError as e:
         raise HTTPException(422, str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POST /v1/probe
+# Pure activation extraction — no generation, no session state.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ProbeRequest(BaseModel):
+    text:     str             = Field(..., description="Input text to encode.")
+    layers:   List[int]       = Field(
+        [-1], description="Layer indices to extract (-1 = last layer)."
+    )
+    pooling:  str             = Field(
+        "last_token",
+        description="Pooling strategy: 'last_token' (default) or 'mean'.",
+    )
+    centered: bool            = Field(
+        True,
+        description="Subtract per-layer sequence mean before pooling.",
+    )
+
+
+class ProbeResponse(BaseModel):
+    activations: Dict[str, List[float]] = Field(
+        ...,
+        description="Layer index (as string) → activation vector.",
+    )
+    input_tokens: int
+    elapsed_s: float
+    model: str
+
+
+@app.post("/v1/probe", response_model=ProbeResponse, tags=["ERIS v5"])
+async def v1_probe(req: ProbeRequest):
+    """
+    Extract hidden-state activations for one input text.
+
+    Pure representation extraction — no text generation, no session state.
+    The zombie model is called with a forward pass only (no generate()).
+    Returns {layer_idx: activation_vector} for each requested layer.
+
+    This is the primary interface to the zombie in the new ERIS paradigm.
+    Use DriftDetector + ERISOrchestrator to decide when to call this.
+    """
+    eng = _require_engine()
+
+    try:
+        # Use the engine's encode() infrastructure for consistency.
+        # We request the specific layers and pool client-side.
+        import base64
+
+        result_activations: Dict[str, List[float]] = {}
+        t0 = time.time()
+
+        for layer_idx in req.layers:
+            enc = eng.encode(req.text, return_layers=[layer_idx], session_id=None)
+            hd = enc.get("hidden_dim", 0)
+            hs = enc.get("hidden_states", {})
+
+            for val in hs.values():
+                if isinstance(val, str):
+                    import numpy as _np
+                    flat = _np.frombuffer(base64.b64decode(val), dtype=_np.float32)
+                    mat  = flat.reshape(-1, hd)       # [seq, hidden_dim]
+                elif isinstance(val, list):
+                    import numpy as _np
+                    mat = _np.array(val, dtype=_np.float32)
+                    if mat.ndim == 1:
+                        mat = mat.reshape(1, -1)
+                else:
+                    continue
+
+                if req.centered:
+                    mat = mat - mat.mean(axis=0, keepdims=True)
+
+                if req.pooling == "last_token":
+                    vec = mat[-1]
+                elif req.pooling == "mean":
+                    vec = mat.mean(axis=0)
+                else:
+                    raise HTTPException(422, f"Unknown pooling: {req.pooling!r}")
+
+                result_activations[str(layer_idx)] = vec.tolist()
+                break
+
+        n_tokens = len(eng.tokenizer(req.text)["input_ids"])
+        elapsed  = time.time() - t0
+        model_name = getattr(eng, "model_name", "unknown")
+
+        return ProbeResponse(
+            activations=result_activations,
+            input_tokens=n_tokens,
+            elapsed_s=round(elapsed, 4),
+            model=model_name,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        _eris_log.exception("v1_probe error")
+        raise HTTPException(500, str(e))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

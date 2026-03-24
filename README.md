@@ -93,25 +93,82 @@ python eval/eval_phase1_v1.py --eris-url http://localhost:8001 --layer 9
 
 ---
 
+## Architecture
+
+```
+ANCIEN : Claude ↔ Zombie (dialogue, enrichissement bidirectionnel)
+
+NOUVEAU :
+                    ┌─────────────────────────────────────┐
+                    │           ERISOrchestrator           │
+                    │                                      │
+  Problem ──────→  │  Claude (raisonnement principal)     │──→ Solution
+                    │       ↓ drift détecté ?              │
+                    │  DriftDetector.should_consult_probe  │
+                    │       ↓ oui                          │
+                    │  LatentProbe.probe(input, layers)    │
+                    │       ↓ numpy activations            │
+                    │  Claude interprète → recalibration   │
+                    └──────────────────┬──────────────────┘
+                                       │
+                              Zombie (tool pur)
+                              max_new_tokens = 0
+                              pas de génération
+                              pas d'accès web
+```
+
+The zombie is no longer a participant. It is a **pure representation tool**.
+`LatentProbe.probe()` returns `{layer: np.ndarray}`. No text. No opinion.
+
+Claude calls the probe when `DriftDetector` signals that the latent state
+has diverged from the reference by more than the configured threshold.
+It reads a structured description of the activation geometry and decides
+whether to recalibrate — or ignore the signal.
+
+### Kill-gated experiment pipeline
+
+Before running the full system, Test 0 must pass:
+
+```
+test_0_drift_characterization.py   Spearman ρ(drift, error) ≥ 0.35 → proceed
+                                   ρ < 0.35 → STOP (drift non-predictive)
+
+test_1_probe_detection.py          (not created — requires test_0 passing)
+test_2_intervention.py             (not created — requires test_1 passing)
+```
+
+---
+
 ## Key endpoints
 
 | Endpoint | Description |
 |---|---|
-| `POST /v1/encode` | Hidden states per layer (base64 float32) |
-| `POST /v1/bridge` | Full Claude → Zombie → Claude pipeline |
-| `POST /v1/inject` | Surgical hidden-state injection |
+| `POST /v1/probe` | **[New]** Pure activation extraction — no generation, no sessions |
+| `POST /v1/encode` | Hidden states per layer (base64 float32, full sequence) |
+| `POST /v1/latent_think` | Latent rollout with trajectory |
 | `POST /v1/analyze` | SAE / Â-hat / cosine / PCA on stored thought |
-| `POST /v1/latent_think` | Latent rollout with perturbation support |
+| `POST /v1/inject` | Surgical hidden-state injection |
+| `POST /v1/bridge` | [Phase 1, kept] Full Claude → Zombie → Claude pipeline |
 
 ---
 
 ## Project structure
 
 ```
-eris_server.py             ERIS v5 server
+eris_server.py             ERIS v5 server (adds /v1/probe to existing endpoints)
 eris_client.py             Python client (ERISClient, ClaudeZombieBridge)
 engine.py                  Core LatentMAS engine
-eris/                      Analyzers, injector, bridge, trajectory
+eris/
+  probe.py                 LatentProbe — pure activation extraction (max_new_tokens=0)
+  drift_detector.py        DriftDetector — cosine/LLC drift metrics + window smoothing
+  orchestrator.py          ERISOrchestrator — Claude + DriftDetector + LatentProbe loop
+  bridge.py                [Phase 1, kept] Claude↔Zombie bridge pipeline
+  analyzers.py             SAEAnalyzer, AHatAnalyzer, CosineMapAnalyzer, PCA, Norm
+  config.py / injector.py / trajectory.py / implicit_features.py
+  experiments/
+    drift_detection/
+      kill_criteria.py                    Explicit stop/pivot thresholds
+      test_0_drift_characterization.py    Kill gate — ρ(drift, error) ≥ 0.35
 eval/
   eval_phase1_v1.py        Full eval suite (M4–M6, ABC, steering, loop, dialogue, frontier, web)
   train_sae.py             SAE trainer (collect → train → checkpoint)
