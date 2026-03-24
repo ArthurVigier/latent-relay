@@ -37,6 +37,10 @@ duckduckgo-search>=6.0.0   # frontier/webdialogue web search (no API key needed)
 # Testing
 pytest>=8.0.0
 
+# ERIS V2 — SAE probe (Gemma Scope 2)
+# Installer avant de lancer scripts/validate_sae_on_aime.py
+sae-lens>=5.0.0               # SAEs pré-entraînées + Gemma Scope 2
+transformer-lens>=3.0.0b0     # requis par sae-lens v5 pour Gemma 3
+
 # ERIS v5 — optional lazy-loaded analyzers
-# sae-lens>=5.0.0       # SAEs pré-entraînées (pip install sae-lens)
 # a-hat-optimizer       # Sonde Â-hat (install depuis le repo Arthur)

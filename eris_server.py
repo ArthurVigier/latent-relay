@@ -663,6 +663,130 @@ async def v1_probe(req: ProbeRequest):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ERIS V2 — /v1/sae_probe  (Gemma Scope 2 SAE features)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# SAEProbe est lazy-loaded à la première requête pour ne pas bloquer le startup
+# si sae-lens n'est pas installé.
+_sae_probe = None
+_sae_probe_lock = __import__("threading").Lock()
+
+
+class SAEProbeRequest(BaseModel):
+    text:       str   = Field(..., description="Texte à encoder via SAE.")
+    model_id:   str   = Field(
+        "google/gemma-3-9b-it",
+        description="Modèle zombie : 'google/gemma-3-9b-it' ou 'google/gemma-3-27b-it'.",
+    )
+    layers:     List[int] = Field(
+        [10, 20, 30],
+        description="Layers à sonder. Pour Gemma 3 9B : [10, 20, 30] recommandé.",
+    )
+    sae_width:  str   = Field("16k",    description="Largeur SAE : 16k, 64k, 256k, 1m.")
+    l0:         str   = Field("medium", description="Sparsité SAE : small, medium, big.")
+    top_k:      int   = Field(20, ge=1, le=500, description="Features top-K retournées.")
+    device:     str   = Field("cuda",   description="Device torch.")
+
+
+class SAEProbeResponse(BaseModel):
+    layers: Dict[str, Any] = Field(
+        description="Par layer : {active_feature_indices, active_feature_values, "
+                    "n_active, n_all_active}.",
+    )
+    model_id:   str
+    input_tokens: int
+    elapsed_s:  float
+
+
+@app.post("/v1/sae_probe", tags=["ERIS V2"])
+async def v1_sae_probe(req: SAEProbeRequest):
+    """
+    Extraction de features SAE via Gemma Scope 2.
+
+    Remplace /v1/encode pour les expériences de drift detection V2.
+    Le modèle zombie (Gemma 3 9B ou 27B) effectue un forward pass et
+    encode les activations via les SAEs Gemma Scope 2.
+
+    Retourne les features SAE actives (indices + valeurs) pour chaque
+    layer demandé — pas d'activations brutes dans la réponse.
+
+    Les anciens endpoints (/v1/encode, /v1/bridge, etc.) restent intacts.
+
+    Prérequis :
+        pip install sae-lens
+        pip install transformer-lens>=3.0.0b0
+
+    Exemple ::
+
+        curl -X POST http://localhost:8001/v1/sae_probe \\
+          -H 'Content-Type: application/json' \\
+          -d '{
+            "text": "Find all integers n such that n^2 + 1 is divisible by 5.",
+            "layers": [10, 20, 30],
+            "top_k": 20
+          }'
+    """
+    global _sae_probe
+
+    try:
+        # Lazy-load SAEProbe (bloquant à la première requête)
+        with _sae_probe_lock:
+            if _sae_probe is None or (
+                _sae_probe.model_id   != req.model_id
+                or _sae_probe.sae_width != req.sae_width
+                or _sae_probe.l0        != req.l0
+            ):
+                _eris_log.info(
+                    "Chargement SAEProbe: model=%s sae=%s/l0_%s layers=%s",
+                    req.model_id, req.sae_width, req.l0, req.layers,
+                )
+                from eris.sae_probe import SAEProbe
+                _sae_probe = SAEProbe(
+                    model_id=req.model_id,
+                    layers=req.layers,
+                    sae_width=req.sae_width,
+                    l0=req.l0,
+                    device=req.device,
+                )
+
+        # Probe
+        t0 = time.time()
+        probe_out = _sae_probe.probe(req.text, top_k=req.top_k)
+        elapsed   = round(time.time() - t0, 4)
+
+        # Sérialiser
+        layers_resp: dict[str, Any] = {}
+        for layer_idx, out in probe_out.items():
+            layers_resp[str(layer_idx)] = {
+                "active_feature_indices": out.active_feature_indices,
+                "active_feature_values":  out.active_feature_values,
+                "n_active":               out.n_active,
+                "n_all_active":           len(out.all_active_indices),
+            }
+
+        # Compter les tokens via le tokenizer du SAEProbe
+        n_tokens = len(_sae_probe._tokenizer(req.text)["input_ids"])
+
+        return SAEProbeResponse(
+            layers=layers_resp,
+            model_id=req.model_id,
+            input_tokens=n_tokens,
+            elapsed_s=elapsed,
+        )
+
+    except ImportError as e:
+        raise HTTPException(
+            503,
+            detail=str(e) + " — installer : pip install sae-lens",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        _eris_log.exception("v1_sae_probe error")
+        raise HTTPException(500, str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Entry point
 # ══════════════════════════════════════════════════════════════════════════════
 

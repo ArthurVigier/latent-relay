@@ -76,6 +76,65 @@ grep -rn "webdialogue\|zombie_turn\|enrichissement\|enriched_text\|safe_enrichme
 
 ---
 
+## ERIS V2 Reframe — SAE Features (completed)
+
+### Paradigme
+
+```
+V1 : activations brutes numpy [hidden_dim] → Claude devine dans le vide
+V2 : activations → SAE.encode() → features sparse [16K] → diff de sets
+     → Claude lit des concepts (indices Neuronpedia)
+```
+
+### Stack zombie V2
+
+| Composant | V1 | V2 |
+|---|---|---|
+| Modèle probe | Qwen3-14B (LatentProbe) | Gemma 3 9B/27B (SAEProbe) |
+| Encodage | activations brutes numpy | features SAE Gemma Scope 2 |
+| Drift metric | cosine + LLC (LLC = KL-div top-k) | Jaccard features + cosine brut |
+| Release SAE | N/A | `gemma-scope-2-9b-it-res` |
+| Format SAE ID | N/A | `layer_{n}_width_16k_l0_medium` |
+
+### Nouveaux fichiers
+
+| Fichier | Description |
+|---|---|
+| `scripts/validate_sae_on_aime.py` | Kill gate 0 — SAEs utiles sur AIME ? |
+| `eris/sae_probe.py` | `SAEProbe` — Gemma 3 + Gemma Scope 2 |
+
+### Fichiers remplacés (V1 → V2)
+
+| Fichier | Changement |
+|---|---|
+| `eris/drift_detector.py` | `DriftReport` V2 avec `features_lost`, `features_gained`, Jaccard. Import `ProbeOutput` depuis `sae_probe` à la place de `interfaces.py` |
+| `eris/orchestrator.py` | `ERISOrchestrator` utilise `SAEProbe` + `OrchestratorLLM`. Template `_RECALIBRATION_TEMPLATE` orienté features SAE |
+| `eris/experiments/drift_detection/kill_criteria.py` | Ajout `sae_validation` + `test_3_scaling`. Check `range` pour sae_validation |
+| `eris/experiments/drift_detection/test_0_drift_characterization.py` | V2 avec `SAEProbe`. Mode `server` (Qwen3 via ERIS) ou `direct` (pipeline test) |
+
+### Endpoint ajouté
+
+| Endpoint | Description |
+|---|---|
+| `POST /v1/sae_probe` | Features SAE par layer — lazy-load SAEProbe à la première requête |
+
+### Compatibilité V1
+
+`eris/interfaces.py` — `DriftReport` V1 intact (utilisé par backends ClaudeOrchestrator, etc.)
+`eris/probe.py` — `LatentProbe` intact (V1 baseline)
+`eris/backends/` — tous les backends V1 intacts
+
+### Ordre d'exécution
+
+```bash
+pip install sae-lens transformer-lens>=3.0.0b0
+python scripts/validate_sae_on_aime.py        # KILL GATE — exit 0 = OK
+python eris/experiments/drift_detection/test_0_drift_characterization.py --mode server
+# Si ρ ≥ 0.35 → créer test_1.py
+```
+
+---
+
 ## Correction 1 — Modularité (completed)
 
 ### New files

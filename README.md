@@ -93,49 +93,64 @@ python eval/eval_phase1_v1.py --eris-url http://localhost:8001 --layer 9
 
 ---
 
-## Architecture
+## Architecture V2 — Drift Detection via SAE Features
 
 ```
-ANCIEN : Claude ↔ Zombie (dialogue, enrichissement bidirectionnel)
+ANCIEN (V1) : Claude ↔ Zombie (dialogue, activations brutes numpy)
 
-NOUVEAU :
-                    ┌─────────────────────────────────────┐
-                    │           ERISOrchestrator           │
-                    │                                      │
-  Problem ──────→  │  Claude (raisonnement principal)     │──→ Solution
-                    │       ↓ drift détecté ?              │
-                    │  DriftDetector.should_consult_probe  │
-                    │       ↓ oui                          │
-                    │  LatentProbe.probe(input, layers)    │
-                    │       ↓ numpy activations            │
-                    │  Claude interprète → recalibration   │
-                    └──────────────────┬──────────────────┘
+NOUVEAU (V2) :
+                    ┌──────────────────────────────────────────┐
+                    │            ERISOrchestrator V2            │
+                    │                                          │
+  Problem ───────→  │  Claude (raisonnement principal)         │──→ Solution
+                    │       ↓ checkpoint drift ?               │
+                    │  DriftDetector.compute_drift()           │
+                    │  (Jaccard features + cosine, lissé)      │
+                    │       ↓ drift_score > 0.35 ?             │
+                    │  SAEProbe.probe(context)                  │
+                    │       ↓                                   │
+                    │  features SAE sparse [16K/64K dims]      │
+                    │  features_lost + features_gained         │
+                    │       ↓                                   │
+                    │  Claude lit des concepts, recalibre       │
+                    └──────────────────┬───────────────────────┘
                                        │
-                              Zombie (tool pur)
-                              max_new_tokens = 0
-                              pas de génération
-                              pas d'accès web
+              Gemma 3 9B (tests) / 27B (scaling)
+              + SAEs Gemma Scope 2 (gemma-scope-2-9b-it-res)
+              max_new_tokens = 0 — aucune génération
+              Output : features SAE sparse {layer: ProbeOutput}
+              Pas d'accès web — pas de dialogue
 ```
 
-The zombie is no longer a participant. It is a **pure representation tool**.
-`LatentProbe.probe()` returns `{layer: np.ndarray}`. No text. No opinion.
-
-Claude calls the probe when `DriftDetector` signals that the latent state
-has diverged from the reference by more than the configured threshold.
-It reads a structured description of the activation geometry and decides
-whether to recalibrate — or ignore the signal.
-
-### Kill-gated experiment pipeline
-
-Before running the full system, Test 0 must pass:
+**Pourquoi SAE plutôt qu'activations brutes ?**
+Les features Gemma Scope sont sparse et sémantiques : chaque index correspond
+à un concept interprétable (via Neuronpedia). Claude reçoit une diff de sets —
+"feature 412 a disparu, feature 7831 est apparue" — pas des coordonnées dans
+un espace de 4096 dimensions.
 
 ```
-test_0_drift_characterization.py   Spearman ρ(drift, error) ≥ 0.35 → proceed
-                                   ρ < 0.35 → STOP (drift non-predictive)
-
-test_1_probe_detection.py          (not created — requires test_0 passing)
-test_2_intervention.py             (not created — requires test_1 passing)
+Ancien : activations [hidden_dim=4096] → Claude devine dans le vide
+Nouveau : features sparse [n_active ~50/16384] → Claude lit des concepts
 ```
+
+### Kill-gated experiment pipeline (V2)
+
+```
+scripts/validate_sae_on_aime.py        SAEs utiles sur AIME ?
+                                        mean_active ∈ [5, 500] → continuer
+                                        sinon → STOP TOTAL
+
+test_0_drift_characterization.py       Spearman ρ(drift_SAE, error) ≥ 0.35 → continuer
+                                        ρ < 0.35 → STOP
+
+test_1_probe_detection.py              AUC(Jaccard) ≥ 0.60 → continuer   [stub]
+test_2_intervention.py                 accuracy delta ≥ 5pp → continuer   [stub]
+test_3_scaling_27b.py                  AUC delta 27B vs 9B ≥ 5pp          [stub]
+```
+
+**Stack matérielle :**
+- Tests de principe : Gemma 3 9B + Gemma Scope 2 → A100 80GB
+- Scaling : Gemma 3 27B + Gemma Scope 2 → H100 80GB (~$3-4/h RunPod)
 
 ---
 
@@ -143,7 +158,8 @@ test_2_intervention.py             (not created — requires test_1 passing)
 
 | Endpoint | Description |
 |---|---|
-| `POST /v1/probe` | **[New]** Pure activation extraction — no generation, no sessions |
+| `POST /v1/sae_probe` | **[V2]** Features SAE Gemma Scope 2 — indices + valeurs par layer |
+| `POST /v1/probe` | Activation extraction brute (V1, numpy) |
 | `POST /v1/encode` | Hidden states per layer (base64 float32, full sequence) |
 | `POST /v1/latent_think` | Latent rollout with trajectory |
 | `POST /v1/analyze` | SAE / Â-hat / cosine / PCA on stored thought |

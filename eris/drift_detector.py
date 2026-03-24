@@ -1,39 +1,35 @@
 """
-ERIS v5 — DriftDetector
-========================
+eris/drift_detector.py
+=======================
 
-Measures latent-state divergence between a reference activation snapshot
-and a sequence of subsequent activations.  Triggers a probe consultation
-when divergence exceeds the configured threshold.
+Détecteur de drift latent V2 — basé sur features SAE.
 
-Role in the new ERIS paradigm:
-  Claude extracts activations at regular checkpoints during reasoning.
-  DriftDetector compares them to the initial (reference) state and decides
-  whether the reasoning trajectory has drifted far enough to warrant a
-  consultation with LatentProbe.  It does not modify Claude's output —
-  it only signals when to ask for an external reference frame.
+Rôle dans ERIS V2 : mesurer la divergence entre la représentation SAE
+initiale (référence) et les représentations aux checkpoints suivants.
 
-Metrics implemented:
-  1. Cosine distance per layer  — direction change from reference
-  2. L2 distance per layer      — magnitude change from reference
-  3. Combined drift_score       — weighted average of cosine distances,
-                                  smoothed over a moving window of `window`
-                                  recent steps to suppress transient spikes
-  4. LLC Score (simplified)     — KL-divergence between top-k activation
-                                  rank distributions (reference vs current)
-                                  — signals feature-composition shift, not
-                                  just directional drift
+Pourquoi les features SAE plutôt que les activations brutes ?
+    - Les features sont sparse et sémantiques : un index = un concept.
+    - La divergence devient une diff de sets interprétable.
+    - Claude peut lire "feature 412 a disparu" et y attacher du sens
+      (via Neuronpedia) plutôt que "dim 412 a varié de 0.3".
+
+Métriques combinées :
+    1. Distance Jaccard sur les features actives (drift thématique)
+    2. Distance cosine sur les activations brutes (drift géométrique)
+    → Score final = moyenne pondérée, lissée sur une fenêtre mobile.
 
 Usage::
 
-    detector = DriftDetector(threshold=0.3, window=5)
-    detector.register_reference(probe.probe(problem_statement))
+    detector = DriftDetector(threshold=0.35, window=3)
 
-    for step, reasoning_chunk in enumerate(reasoning_steps):
-        acts = probe.probe(reasoning_chunk)
-        report = detector.compute_drift(acts, step=step + 1)
+    ref = sae_probe.probe(problem_statement)
+    detector.register_reference(ref, step=0)
+
+    for step, reasoning_chunk in enumerate(steps):
+        cur = sae_probe.probe(reasoning_chunk)
+        report = detector.compute_drift(cur, step=step + 1)
         if report.should_consult_probe:
-            # pass activations + report to Claude as context
+            # passer report.summary à Claude
             ...
 """
 
@@ -41,233 +37,245 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
 
-from eris.interfaces import DriftReport
+# Note : DriftReport V2 est défini localement.
+# Le DriftReport V1 (eris/interfaces.py) reste intact pour les backends V1.
+from eris.sae_probe import ProbeOutput
 
-log = logging.getLogger("eris.drift")
+log = logging.getLogger("eris.drift_detector")
+
+
+# ── Result dataclass ──────────────────────────────────────────────────────────
+
+@dataclass
+class DriftReport:
+    """
+    Résultat d'un appel DriftDetector.compute_drift() — version V2 SAE.
+
+    Attributes:
+        step:                  Étape de raisonnement.
+        drift_score:           Score [0, 1], lissé sur la fenêtre.
+        raw_drift_score:       Score brut non lissé pour ce step.
+        should_consult_probe:  True si drift_score > threshold.
+        threshold:             Seuil actif.
+        features_lost:         {layer: [indices]} features actives au step 0
+                               absentes maintenant.
+        features_gained:       {layer: [indices]} features nouvelles
+                               absentes au step 0.
+        cosine_distances:      {layer: float} distance cosine activations brutes.
+        jaccard_distances:     {layer: float} distance Jaccard features actives.
+        n_active_per_layer:    {layer: int} features actives au step courant.
+        summary:               Description lisible pour Claude.
+    """
+    step:                 int
+    drift_score:          float
+    raw_drift_score:      float
+    should_consult_probe: bool
+    threshold:            float
+    features_lost:        dict[int, list[int]]   = field(default_factory=dict)
+    features_gained:      dict[int, list[int]]   = field(default_factory=dict)
+    cosine_distances:     dict[int, float]        = field(default_factory=dict)
+    jaccard_distances:    dict[int, float]        = field(default_factory=dict)
+    n_active_per_layer:   dict[int, int]          = field(default_factory=dict)
+    summary:              str                     = ""
 
 
 # ── DriftDetector ─────────────────────────────────────────────────────────────
 
 class DriftDetector:
     """
-    Stateful detector that tracks latent-state divergence over a reasoning run.
+    Détecteur de drift sur features SAE.
 
     Args:
-        threshold:  Drift score above which should_consult_probe is True.
-                    0.3 is a reasonable starting point — tune based on
-                    test_0 correlation results.
-        window:     Number of recent steps to average for the smoothed
-                    drift_score.  Suppresses single-step spikes.
-        llc_k:      Number of top features used for LLC score computation.
+        threshold:       Seuil de drift_score pour déclencher une consultation.
+        window:          Taille de la fenêtre de lissage (moyenne mobile).
+        jaccard_weight:  Poids de la distance Jaccard (drift thématique).
+        cosine_weight:   Poids de la distance cosine (drift géométrique).
     """
 
     def __init__(
         self,
-        threshold: float = 0.3,
-        window: int = 5,
-        llc_k: int = 32,
+        threshold: float = 0.35,
+        window: int = 3,
+        jaccard_weight: float = 0.6,
+        cosine_weight: float = 0.4,
     ) -> None:
-        self.threshold  = threshold
-        self.window     = window
-        self.llc_k      = llc_k
+        if abs(jaccard_weight + cosine_weight - 1.0) > 1e-6:
+            raise ValueError("jaccard_weight + cosine_weight doit être égal à 1.0")
+        self.threshold      = threshold
+        self.window         = window
+        self.jaccard_weight = jaccard_weight
+        self.cosine_weight  = cosine_weight
 
-        self._reference: Optional[dict[int, np.ndarray]] = None
-        self._history: deque[float] = deque(maxlen=window)
-        self._step_log: list[DriftReport] = []
+        self._reference: Optional[dict[int, ProbeOutput]] = None
+        self._history:   deque = deque(maxlen=window)
+        self._max_drift: float = 0.0
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    @property
+    def max_drift(self) -> float:
+        """Score de drift maximum observé depuis le dernier reset()."""
+        return self._max_drift
 
     def register_reference(
         self,
-        activations: dict[int, np.ndarray],
+        probe_output: dict[int, ProbeOutput],
         step: int = 0,
     ) -> None:
         """
-        Store the initial latent state as the reference for all future comparisons.
+        Enregistre l'état de référence (step 0 du raisonnement).
 
-        Call this once at the start of a reasoning run, with the activations
-        from the problem statement or the first reasoning step.
-
-        Args:
-            activations: {layer_idx: np.ndarray[hidden_dim]}
-            step:        The step number of the reference (informational).
+        À appeler une fois au début de chaque run() avec le probe du
+        problem statement.
         """
-        self._reference = {
-            k: v.copy().astype(np.float32) for k, v in activations.items()
-        }
+        self._reference = probe_output
         self._history.clear()
-        self._step_log.clear()
+        self._max_drift = 0.0
         log.info(
-            "Reference registered at step=%d, layers=%s",
-            step, sorted(activations.keys()),
+            "Référence enregistrée (step=%d) : %d layers, features actives : %s",
+            step,
+            len(probe_output),
+            {k: v.n_active for k, v in probe_output.items()},
         )
 
     def compute_drift(
         self,
-        activations: dict[int, np.ndarray],
+        probe_output: dict[int, ProbeOutput],
         step: int,
     ) -> DriftReport:
         """
-        Compare current activations to the reference and return a DriftReport.
+        Calcule le drift entre la référence et l'état courant.
 
         Args:
-            activations: {layer_idx: np.ndarray[hidden_dim]}
-            step:        Current reasoning step number (used for logging).
+            probe_output: Résultat de SAEProbe.probe() sur le contexte courant.
+            step:         Index du step de raisonnement.
 
         Returns:
-            DriftReport with all metrics populated.
+            DriftReport avec métriques par layer et score global.
 
         Raises:
-            RuntimeError: If register_reference() has not been called yet.
+            RuntimeError: Si register_reference() n'a pas été appelé.
         """
         if self._reference is None:
             raise RuntimeError(
-                "Call register_reference() before compute_drift()."
+                "Appelle register_reference() avant compute_drift()."
             )
 
-        # Only compare layers present in both reference and current.
-        common_layers = sorted(
-            set(self._reference.keys()) & set(activations.keys())
-        )
-        if not common_layers:
-            raise RuntimeError(
-                "No layer overlap between reference and current activations."
+        features_lost:    dict[int, list[int]]  = {}
+        features_gained:  dict[int, list[int]]  = {}
+        cosine_distances: dict[int, float]       = {}
+        jaccard_distances: dict[int, float]      = {}
+        n_active:         dict[int, int]         = {}
+
+        for layer_idx, ref in self._reference.items():
+            cur = probe_output.get(layer_idx)
+            if cur is None:
+                log.warning("Layer %d absent du probe courant", layer_idx)
+                continue
+
+            ref_set = set(ref.all_active_indices)
+            cur_set = set(cur.all_active_indices)
+
+            features_lost[layer_idx]   = sorted(ref_set - cur_set)
+            features_gained[layer_idx] = sorted(cur_set - ref_set)
+            n_active[layer_idx]        = cur.n_active
+
+            # Distance Jaccard sur les features actives
+            union        = len(ref_set | cur_set)
+            intersection = len(ref_set & cur_set)
+            jaccard_distances[layer_idx] = (
+                1.0 - intersection / union if union > 0 else 0.0
             )
 
-        cosine_dists: dict[int, float] = {}
-        l2_dists: dict[int, float]     = {}
-        llc_scores: dict[int, float]   = {}
+            # Distance cosine sur les activations brutes
+            ref_vec = ref.raw_activations.astype(np.float32)
+            cur_vec = cur.raw_activations.astype(np.float32)
+            norm    = float(np.linalg.norm(ref_vec) * np.linalg.norm(cur_vec))
+            cosine_distances[layer_idx] = (
+                float(1.0 - np.dot(ref_vec, cur_vec) / norm)
+                if norm > 0 else 0.0
+            )
 
-        for layer in common_layers:
-            ref = self._reference[layer].astype(np.float32)
-            cur = activations[layer].astype(np.float32)
+        # Score global — moyenne pondérée sur les layers
+        if jaccard_distances:
+            mean_jaccard = float(np.mean(list(jaccard_distances.values())))
+            mean_cosine  = float(np.mean(list(cosine_distances.values())))
+            raw_score    = (
+                self.jaccard_weight * mean_jaccard
+                + self.cosine_weight * mean_cosine
+            )
+        else:
+            raw_score = 0.0
 
-            cosine_dists[layer] = float(_cosine_distance(ref, cur))
-            l2_dists[layer]     = float(np.linalg.norm(cur - ref))
-            llc_scores[layer]   = float(_llc_score(ref, cur, k=self.llc_k))
+        raw_score = max(0.0, min(1.0, raw_score))
 
-        # Raw drift = mean cosine distance across layers (primary signal).
-        raw_score = float(np.mean(list(cosine_dists.values())))
+        # Moyenne mobile (lissage sur la fenêtre)
         self._history.append(raw_score)
+        drift_score = float(np.mean(self._history))
+        self._max_drift = max(self._max_drift, drift_score)
 
-        # Smoothed drift = mean of recent `window` raw scores.
-        smoothed = float(np.mean(self._history))
+        should_consult = drift_score > self.threshold
 
-        # Layers most affected = ranked by cosine distance.
-        layers_affected = sorted(
-            common_layers,
-            key=lambda l: cosine_dists[l],
-            reverse=True,
+        summary = self._build_summary(
+            step, drift_score, raw_score,
+            features_lost, features_gained, cosine_distances, n_active,
+            should_consult,
         )
 
-        report = DriftReport(
+        log.debug(
+            "step=%d drift=%.4f (raw=%.4f) consult=%s",
+            step, drift_score, raw_score, should_consult,
+        )
+
+        return DriftReport(
             step=step,
-            drift_score=round(smoothed, 5),
-            raw_drift_score=round(raw_score, 5),
-            cosine_distances={k: round(v, 5) for k, v in cosine_dists.items()},
-            l2_distances={k: round(v, 4) for k, v in l2_dists.items()},
-            llc_scores={k: round(v, 5) for k, v in llc_scores.items()},
-            layers_affected=layers_affected,
-            should_consult_probe=smoothed > self.threshold,
+            drift_score=drift_score,
+            raw_drift_score=raw_score,
+            should_consult_probe=should_consult,
             threshold=self.threshold,
+            features_lost=features_lost,
+            features_gained=features_gained,
+            cosine_distances=cosine_distances,
+            jaccard_distances=jaccard_distances,
+            n_active_per_layer=n_active,
+            summary=summary,
         )
-        self._step_log.append(report)
-
-        log.info(
-            "step=%d drift=%.4f (raw=%.4f) consult=%s layers=%s",
-            step, smoothed, raw_score,
-            report.should_consult_probe, layers_affected[:3],
-        )
-        return report
 
     def reset(self) -> None:
-        """Reset all state for a new reasoning run."""
+        """Réinitialise le détecteur (référence + historique)."""
         self._reference = None
         self._history.clear()
-        self._step_log.clear()
-        log.debug("DriftDetector reset.")
+        self._max_drift = 0.0
 
-    @property
-    def history(self) -> list[DriftReport]:
-        """All DriftReport objects recorded since last reset/reference."""
-        return list(self._step_log)
+    # ── Internal ──────────────────────────────────────────────────────────────
 
-    @property
-    def max_drift(self) -> Optional[float]:
-        """Peak smoothed drift_score across all recorded steps."""
-        if not self._step_log:
-            return None
-        return max(r.drift_score for r in self._step_log)
-
-    def summary(self) -> str:
-        """Human-readable summary of the drift history."""
-        if not self._step_log:
-            return "DriftDetector: no steps recorded."
-        consults = sum(1 for r in self._step_log if r.should_consult_probe)
+    def _build_summary(
+        self,
+        step: int,
+        drift_score: float,
+        raw_score: float,
+        lost: dict[int, list[int]],
+        gained: dict[int, list[int]],
+        cosine: dict[int, float],
+        n_active: dict[int, int],
+        should_consult: bool,
+    ) -> str:
+        status = "CONSULTER PROBE" if should_consult else "stable"
         lines = [
-            f"DriftDetector: {len(self._step_log)} steps, "
-            f"{consults} probe consultations triggered",
-            f"  threshold={self.threshold}, window={self.window}",
-            f"  max_drift={self.max_drift:.4f}",
-            "  step | raw   | smoothed | consult",
+            f"[Step {step}] Drift score: {drift_score:.3f} "
+            f"(raw: {raw_score:.3f}, seuil: {self.threshold}) — {status}",
         ]
-        for r in self._step_log:
-            flag = "!" if r.should_consult_probe else " "
+        for layer in sorted(lost.keys()):
+            n = n_active.get(layer, 0)
+            n_lost   = len(lost.get(layer, []))
+            n_gained = len(gained.get(layer, []))
+            cos      = cosine.get(layer, 0.0)
             lines.append(
-                f"  {r.step:4d} | {r.raw_drift_score:.4f} | "
-                f"{r.drift_score:.4f}   | {flag}"
+                f"  Layer {layer}: {n} actives | "
+                f"-{n_lost} perdues | +{n_gained} nouvelles | "
+                f"cosine={cos:.3f}"
             )
         return "\n".join(lines)
-
-
-# ── Metric helpers (pure functions) ──────────────────────────────────────────
-
-def _cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
-    """
-    Cosine distance in [0, 1].  0 = identical direction, 1 = orthogonal.
-    Clipped to [0, 1] to guard against floating-point overflow.
-    """
-    na = np.linalg.norm(a)
-    nb = np.linalg.norm(b)
-    if na < 1e-10 or nb < 1e-10:
-        return 0.0
-    sim = np.dot(a, b) / (na * nb)
-    sim = float(np.clip(sim, -1.0, 1.0))
-    return (1.0 - sim) / 2.0  # map [-1,1] → [1,0]
-
-
-def _llc_score(ref: np.ndarray, cur: np.ndarray, k: int = 32) -> float:
-    """
-    Simplified LLC (Local Latent Composition) score.
-
-    Approximates whether the *which* features are active has changed, not
-    just the direction.  Computes the KL-divergence between the softmax
-    distributions over the top-k absolute activation values in ref and cur.
-
-    Returns a value ≥ 0.  Values near 0 mean the same features dominate;
-    higher values mean the composition has shifted.
-    """
-    dim = min(len(ref), len(cur), k)
-    if dim < 2:
-        return 0.0
-
-    # Top-k indices by absolute magnitude.
-    top_ref = np.argsort(np.abs(ref))[-dim:]
-    top_cur = np.argsort(np.abs(cur))[-dim:]
-
-    # Build probability distributions over the full dimension using only
-    # the union of top-k indices, softmax-normalised.
-    all_idx = list(set(top_ref.tolist()) | set(top_cur.tolist()))
-    p = np.abs(ref[all_idx]).astype(np.float64) + 1e-10
-    q = np.abs(cur[all_idx]).astype(np.float64) + 1e-10
-    p /= p.sum()
-    q /= q.sum()
-
-    # Symmetric KL: (KL(p||q) + KL(q||p)) / 2
-    kl_pq = float(np.sum(p * np.log(p / q)))
-    kl_qp = float(np.sum(q * np.log(q / p)))
-    return (kl_pq + kl_qp) / 2.0
