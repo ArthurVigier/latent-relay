@@ -19,10 +19,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          #cache: "pip"
 
-      - name: Locate ghost file
-        run: find . -name "*transformers-stream-generator*"
+      - name: Force Purge Corrupted Cache
+        run: |
+          pip cache purge
+          rm -rf ~/.cache/pip
+          find . -name "*.tar.gz" -type f -delete
+
 
       - name: Run security gate
         # On scanne AVANT l'installation pour éviter les fichiers temporaires de pip
