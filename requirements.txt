@@ -1,11 +1,11 @@
 # Latent Relay Server — Phase 1
 torch>=2.8.0          # <2.5.0 → PYSEC-2024-259 / <2.6.0 → PYSEC-2025-41 / <2.7.1 → GHSA-3749 / <2.8.0 → GHSA-887c
 transformers>=4.53.0  # <4.52.1 → GHSA-37mw / <4.53.0 → GHSA-4w7r
-accelerate>=0.25.0
+accelerate>=0.26.0
 
 # FastAPI server
-fastapi>=0.110.0
-uvicorn>=0.27.0
+fastapi>=0.115.0      # Bumped to avoid known vulnerabilities in older 0.110.x
+uvicorn>=0.30.0
 pydantic>=2.4.0       # <2.4.0 → GHSA-mr82-8j83-vxmv
 
 # MCP server
@@ -15,13 +15,13 @@ mcp>=1.23.0           # <1.9.4 → GHSA-3qhf / <1.10.0 → GHSA-j975 / <1.23.0 �
 requests>=2.32.4      # <2.32.0 → GHSA-9wx4 / <2.32.4 → GHSA-9hjg
 
 # Probe loading (required for .pkl/.joblib SAE probes — no pickle.load)
-joblib>=1.3.0
+joblib>=1.4.3         # <1.4.3 → CVE-2024-34997 (Disputed deserialization vulnerability)
 
 # ERIS v5 — required
 numpy>=1.24.0
-pyyaml>=6.0.0
-scikit-learn>=1.5.0       # <1.5.0 → PYSEC-2024-110
-httpx>=0.27.0
+pyyaml>=6.0.1         # Bumped to 6.0.1+ for security/build fixes
+scikit-learn>=1.5.0   # <1.5.0 → PYSEC-2024-110
+httpx>=0.28.1         # Bumped to 0.28.1 to resolve potential httpx/certifi CVEs
 
 # ERIS v5 — Orchestrator backends
 anthropic>=0.40.0
