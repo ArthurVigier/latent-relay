@@ -66,12 +66,10 @@ class GeminiOrchestrator(OrchestratorLLM):
         uncertainty_threshold: float = 0.6,
         api_key: Optional[str] = None,
     ) -> None:
-        import importlib
-
-        genai_spec = importlib.util.find_spec("google.generativeai")
-        if genai_spec is None:
+        try:
+            import google.generativeai as genai
+        except ImportError:
             raise ImportError("Google Generative AI package required: pip install google-generativeai")
-        genai = importlib.import_module("google.generativeai")
 
         self.model = model
         self.max_tokens = max_tokens
