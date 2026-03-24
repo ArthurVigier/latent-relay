@@ -21,24 +21,21 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Clean up obsolete artifacts
-        run: find . -name "*.tar.gz" -type f -delete
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Install RTK (Token Optimizer)
-        # On installe RTK ici, avant les tests et le scan
-        run: cargo install --git https://github.com/rtk-ai/rtk --quiet
-        env:
-          CARGO_NET_RETRY: "3"
-
       - name: Run security gate
+        # On scanne AVANT l'installation pour éviter les fichiers temporaires de pip
         run: |
           cargo install --git https://github.com/Krigsexe/ai-rsk --quiet
           ai-rsk scan
         env:
           CARGO_NET_RETRY: "3"
+
+      - name: Install RTK (Token Optimizer)
+        run: cargo install --git https://github.com/rtk-ai/rtk --quiet
+        env:
+          CARGO_NET_RETRY: "3"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
       - name: Run unit tests
         run: pytest test_bridge.py -v
