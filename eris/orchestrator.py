@@ -21,16 +21,16 @@ The zombie never speaks.  It has no opinion.  It is a mirror.
 
 Usage::
 
-    import anthropic
     from eris.probe import LatentProbe
     from eris.drift_detector import DriftDetector
     from eris.orchestrator import ERISOrchestrator
+    from eris.backends.orchestrators.claude_orchestrator import ClaudeOrchestrator
 
     probe    = LatentProbe("Qwen/Qwen3-14B", layers=[9, 18], device="cuda")
     detector = DriftDetector(threshold=0.3, window=5)
-    client   = anthropic.Anthropic()
+    llm      = ClaudeOrchestrator()
 
-    orch = ERISOrchestrator(probe, detector, client)
+    orch = ERISOrchestrator(probe, detector, llm)
     result = orch.run("Prove that √2 is irrational.", max_steps=15)
     print(result.final_answer)
     print(result.consultations)
@@ -45,18 +45,9 @@ from typing import Optional
 
 import numpy as np
 
+from eris.interfaces import OrchestratorLLM, ReasoningStep
+
 log = logging.getLogger("eris.orchestrator")
-
-_CLAUDE_MODEL = "claude-sonnet-4-6"
-
-# ── System prompts ─────────────────────────────────────────────────────────────
-
-_SYSTEM_REASONING = """\
-You are a careful reasoner.  Work through the problem step by step.
-At each step, write a brief label like [Step N] followed by your reasoning.
-When you reach a conclusion, write [Final Answer] followed by your answer.
-Do not rush to a final answer — take as many steps as needed.
-"""
 
 _RECALIBRATION_PROMPT = """\
 [Latent Probe Observation]
@@ -104,30 +95,26 @@ class OrchestratorResult:
 
 class ERISOrchestrator:
     """
-    Connects Claude (primary reasoner) with LatentProbe (representation tool).
+    Connects an OrchestratorLLM (primary reasoner) with a ProbeModel (representation tool).
 
     Args:
-        probe:           Loaded LatentProbe instance.
-        drift_detector:  DriftDetector instance.  Will be reset at the start
-                         of each run() call.
-        claude_client:   anthropic.Anthropic() client.
-        model:           Claude model ID.
+        probe:           Any ProbeModel implementation (LatentProbe, HFProbe, etc.).
+        drift_detector:  DriftDetector instance.  Reset at the start of each run().
+        llm:             Any OrchestratorLLM implementation (ClaudeOrchestrator, etc.).
         probe_layers:    Which layers to extract at each checkpoint.
                          Defaults to the probe's configured layers.
     """
 
     def __init__(
         self,
-        probe,                        # LatentProbe
+        probe,                        # ProbeModel
         drift_detector,               # DriftDetector
-        claude_client,                # anthropic.Anthropic
-        model: str = _CLAUDE_MODEL,
+        llm: OrchestratorLLM,
         probe_layers: Optional[list[int]] = None,
     ) -> None:
         self.probe    = probe
         self.detector = drift_detector
-        self.claude   = claude_client
-        self.model    = model
+        self.llm      = llm
         self.layers   = probe_layers or getattr(probe, "layers", [-1])
 
     # ── Main entry point ──────────────────────────────────────────────────────
@@ -158,34 +145,35 @@ class ERISOrchestrator:
         self.detector.reset()
 
         # Register reference activations on the problem statement.
-        ref_acts = self.probe.probe(problem, pooling=pooling)
+        ref_acts = self.probe.probe(problem, layers=self.layers, pooling=pooling)
         self.detector.register_reference(ref_acts, step=0)
         log.info("Reference registered. Starting reasoning loop (max_steps=%d).", max_steps)
 
-        messages = [{"role": "user", "content": problem}]
+        history: list[ReasoningStep] = []
         reasoning_log: list[dict] = []
         consultations: list[ConsultationRecord] = []
         final_answer = ""
+        recalibration_context: Optional[str] = None
 
         for step in range(1, max_steps + 1):
-            # ── Claude reasoning step ─────────────────────────────────────────
+            # ── LLM reasoning step ────────────────────────────────────────────
             step_t0 = time.time()
             try:
-                response = self.claude.messages.create(
-                    model=self.model,
-                    system=_SYSTEM_REASONING,
-                    messages=messages,
-                    max_tokens=max_tokens_per_step,
+                reasoning_step = self.llm.reason_step(
+                    problem=problem,
+                    history=history,
+                    recalibration_context=recalibration_context,
                 )
-                step_text = response.content[0].text
+                recalibration_context = None  # consumed
             except Exception as e:
-                log.error("Claude API error at step %d: %s", step, e)
+                log.error("LLM reason_step error at step %d: %s", step, e)
                 break
 
-            messages.append({"role": "assistant", "content": step_text})
+            step_text = reasoning_step.content
+            history.append(reasoning_step)
             log.info("Step %d: %d chars, %.2fs", step, len(step_text), time.time() - step_t0)
 
-            # Check if Claude reached a final answer.
+            # Check for final answer.
             if "[Final Answer]" in step_text or step == max_steps:
                 final_answer = step_text
                 reasoning_log.append({
@@ -199,7 +187,7 @@ class ERISOrchestrator:
             consulted   = False
 
             if step % checkpoint_every == 0:
-                cur_acts = self.probe.probe(step_text, pooling=pooling)
+                cur_acts = self.probe.probe(step_text, layers=self.layers, pooling=pooling)
                 report   = self.detector.compute_drift(cur_acts, step=step)
                 drift_score = report.drift_score
 
@@ -212,39 +200,28 @@ class ERISOrchestrator:
                     )
 
                     # Re-probe on the full accumulated context for richer signal.
-                    context_text = "\n".join(
-                        m["content"] for m in messages if m["role"] == "assistant"
+                    context_text = "\n".join(s.content for s in history)
+                    full_acts = self.probe.probe(
+                        context_text[-4096:], layers=self.layers, pooling=pooling
                     )
-                    full_acts = self.probe.probe(context_text[-4096:], pooling=pooling)
                     full_report = self.detector.compute_drift(full_acts, step=step)
 
-                    observation = self._format_activations_for_claude(
-                        full_acts, full_report
+                    observation = self._format_activations_for_claude(full_acts, full_report)
+                    recal_note = self.llm.interpret_activations(
+                        activations_description=observation,
+                        drift_report=full_report,
+                        problem_context=context_text[-2000:],
                     )
-                    recal_prompt = _RECALIBRATION_PROMPT.format(observation=observation)
-                    messages.append({"role": "user", "content": recal_prompt})
-
-                    # Claude recalibration response.
-                    try:
-                        recal_resp = self.claude.messages.create(
-                            model=self.model,
-                            system=_SYSTEM_REASONING,
-                            messages=messages,
-                            max_tokens=max_tokens_per_step,
-                        )
-                        recal_text = recal_resp.content[0].text
-                    except Exception as e:
-                        log.warning("Recalibration API error: %s", e)
-                        recal_text = "[recalibration failed]"
-
-                    messages.append({"role": "assistant", "content": recal_text})
+                    recalibration_context = _RECALIBRATION_PROMPT.format(
+                        observation=recal_note.content
+                    )
 
                     consultations.append(ConsultationRecord(
                         step=step,
                         drift_score=report.drift_score,
                         drift_layers_affected=report.layers_affected[:3],
                         observation_text=observation,
-                        claude_response_preview=recal_text[:200],
+                        claude_response_preview=recal_note.content[:200],
                         elapsed_s=round(time.time() - ct0, 3),
                     ))
 

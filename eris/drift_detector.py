@@ -41,44 +41,13 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
 
+from eris.interfaces import DriftReport
+
 log = logging.getLogger("eris.drift")
-
-
-# ── Result dataclass ──────────────────────────────────────────────────────────
-
-@dataclass
-class DriftReport:
-    """
-    Output of a single DriftDetector.compute_drift() call.
-
-    Attributes:
-        step:                 The reasoning step this report belongs to.
-        drift_score:          Scalar in [0, 1] — higher means more drift.
-                              Smoothed over the configured window.
-        raw_drift_score:      Unsmoothed drift_score for this step only.
-        cosine_distances:     {layer_idx: float} — cosine distance from
-                              reference for each layer.
-        l2_distances:         {layer_idx: float} — L2 distance from reference.
-        llc_scores:           {layer_idx: float} — simplified LLC score
-                              (KL-div of top-k rank distribution).
-        layers_affected:      Layers ranked by cosine distance (highest first).
-        should_consult_probe: True if drift_score > threshold.
-        threshold:            The threshold in effect at this step.
-    """
-    step: int
-    drift_score: float
-    raw_drift_score: float
-    cosine_distances: dict[int, float]
-    l2_distances: dict[int, float]
-    llc_scores: dict[int, float]
-    layers_affected: list[int]
-    should_consult_probe: bool
-    threshold: float
 
 
 # ── DriftDetector ─────────────────────────────────────────────────────────────

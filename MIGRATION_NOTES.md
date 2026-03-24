@@ -76,4 +76,37 @@ grep -rn "webdialogue\|zombie_turn\|enrichissement\|enriched_text\|safe_enrichme
 
 ---
 
+## Correction 1 — Modularité (completed)
+
+### New files
+
+| File | Description |
+|---|---|
+| `eris/interfaces.py` | Abstract base classes `OrchestratorLLM`, `ProbeModel`; canonical `DriftReport`, `ReasoningStep`, `RecalibrationNote` |
+| `eris/backends/orchestrators/claude_orchestrator.py` | `ClaudeOrchestrator` — full Anthropic API implementation |
+| `eris/backends/orchestrators/gemini_orchestrator.py` | Stub |
+| `eris/backends/orchestrators/openai_orchestrator.py` | Stub |
+| `eris/backends/probes/hf_probe.py` | `HFProbe` — full HuggingFace implementation with `steer()` via forward hooks |
+| `eris/backends/probes/vllm_probe.py` | Stub |
+| `eris/factory.py` | `create_orchestrator()`, `create_probe()`, `create_coordinator()` |
+| `eris/multi_agent.py` | `MultiAgentCoordinator` — ISOLATED / SHARED_MEDIUM / COLLABORATIVE modes |
+| `eris/experiments/multi_agent/` | Kill-gate tests MA-0 (full), MA-1 (stub), MA-2 (stub) |
+
+### Modified files
+
+| File | Change |
+|---|---|
+| `eris/probe.py` | `LatentProbe` now inherits `ProbeModel` by delegation to `HFProbe`; adds `steer()`, `steer_batch()`, steering library |
+| `eris/orchestrator.py` | `ERISOrchestrator` now takes `OrchestratorLLM` instead of raw `anthropic.Anthropic` |
+| `eris/drift_detector.py` | `DriftReport` imported from `eris.interfaces` (removed local definition) |
+| `configs/eris_config.yaml` | Added `backends:` and `multi_agent:` sections |
+
+### Backward compatibility
+
+`LatentProbe` still works with existing callers — signature unchanged.
+`ERISOrchestrator` constructor signature changed: `claude_client` replaced by `llm: OrchestratorLLM`.
+Old callers that passed an `anthropic.Anthropic` instance must be updated to pass `ClaudeOrchestrator()`.
+
+---
+
 *Do not act on this file without explicit confirmation. This is a log, not a TODO.*

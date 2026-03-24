@@ -39,6 +39,8 @@ from typing import Optional
 import numpy as np
 import torch
 
+from eris.interfaces import ProbeModel
+
 log = logging.getLogger("eris.probe")
 
 
@@ -68,13 +70,13 @@ class ProbeResult:
 
 # ── LatentProbe ───────────────────────────────────────────────────────────────
 
-class LatentProbe:
+class LatentProbe(ProbeModel):
     """
     Pure representation tool. Input → activations. No text output.
 
-    The model is loaded once and reused across calls.  The forward pass
-    uses model.__call__() directly — not model.generate() — so there is
-    no code path that can produce text output.
+    Implements ProbeModel by delegating to HFProbe.  This keeps backward
+    compatibility (callers that imported LatentProbe directly still work)
+    while the actual logic lives in eris/backends/probes/hf_probe.py.
 
     Args:
         model_id: HuggingFace model name or local path.
@@ -94,49 +96,28 @@ class LatentProbe:
         device: str = "cuda",
         dtype: Optional[torch.dtype] = None,
     ) -> None:
-        self.model_id = model_id
-        self._requested_layers = layers
-        self.device = device if torch.cuda.is_available() else "cpu"
+        from eris.backends.probes.hf_probe import HFProbe
+        self._backend = HFProbe(model_id=model_id, layers=layers, device=device, dtype=dtype)
 
-        if dtype is None:
-            self.dtype = torch.bfloat16 if "cuda" in self.device else torch.float32
-        else:
-            self.dtype = dtype
+        # Expose attributes callers depend on.
+        self.model_id = self._backend.model_id
+        self.device   = self._backend.device
+        self.dtype    = self._backend.dtype
+        self.layers   = self._backend.layers
+        self.n_layers = self._backend.n_layers
 
-        log.info("Loading probe model: %s on %s (%s)", model_id, self.device, self.dtype)
-        t0 = time.time()
-        self._tokenizer, self._model, self.n_layers = self._load_model()
-        self.layers = self._resolve_layers(self._requested_layers)
-        log.info(
-            "Probe ready: %s | %d layers | resolved=%s | %.1fs",
-            model_id, self.n_layers, self.layers, time.time() - t0,
-        )
-
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── ProbeModel interface (delegated to HFProbe) ───────────────────────────
 
     def probe(
         self,
         input_text: str,
+        layers: Optional[list[int]] = None,
         pooling: str = "last_token",
         centered: bool = True,
     ) -> dict[int, np.ndarray]:
-        """
-        Extract hidden-state activations for one input.
-
-        Args:
-            input_text: The text to encode.
-            pooling:    "last_token" (default) or "mean".
-            centered:   If True, subtract the per-layer mean across the
-                        sequence before pooling.  Matches the M4 setup.
-
-        Returns:
-            {layer_idx: np.ndarray[hidden_dim]} — one array per requested layer.
-
-        Raises:
-            ProbeError: On tokenisation failure or empty output.
-        """
-        result = self._forward([input_text], pooling=pooling, centered=centered)
-        return result[0].activations
+        """Extract hidden-state activations for one input."""
+        layers = layers if layers is not None else self.layers
+        return self._backend.probe(input_text, layers=layers, pooling=pooling, centered=centered)
 
     def probe_batch(
         self,
@@ -145,169 +126,45 @@ class LatentProbe:
         pooling: str = "last_token",
         centered: bool = True,
     ) -> list[dict[int, np.ndarray]]:
-        """
-        Extract hidden-state activations for a batch of inputs.
+        """Extract activations for a batch of inputs."""
+        layers = layers if layers is not None else self.layers
+        return self._backend.probe_batch(inputs, layers=layers, pooling=pooling, centered=centered)
 
-        Args:
-            inputs:  List of input strings.
-            layers:  Override layer list for this call.  If None, uses the
-                     layers specified at construction.
-            pooling: "last_token" or "mean".
-            centered: Subtract per-layer sequence mean before pooling.
-
-        Returns:
-            List of {layer_idx: np.ndarray} — one dict per input.
-        """
-        if layers is not None:
-            prev = self.layers
-            self.layers = self._resolve_layers(layers)
-
-        results = self._forward(inputs, pooling=pooling, centered=centered)
-
-        if layers is not None:
-            self.layers = prev
-
-        return [r.activations for r in results]
-
-    # ── Internal ──────────────────────────────────────────────────────────────
-
-    def _load_model(self):
-        """Load tokenizer and model.  Returns (tokenizer, model, n_layers)."""
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            self.model_id,
-            trust_remote_code=True,
-        )
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-
-        model = AutoModelForCausalLM.from_pretrained(
-            self.model_id,
-            torch_dtype=self.dtype,
-            device_map=self.device,
-            trust_remote_code=True,
-        )
-        model.eval()
-
-        # Disable thinking on models that support it (Qwen3.x).
-        # This is belt-and-suspenders: we never call generate(), but if the
-        # model has a generation_config with thinking enabled it can affect
-        # the forward pass internals on some model versions.
-        if hasattr(model, "generation_config"):
-            gc = model.generation_config
-            if hasattr(gc, "enable_thinking"):
-                gc.enable_thinking = False
-            if hasattr(gc, "thinking_budget"):
-                gc.thinking_budget = 0
-
-        # Count transformer layers robustly across architectures.
-        n_layers = _count_layers(model)
-
-        return tokenizer, model, n_layers
-
-    def _resolve_layers(self, layers: list[int]) -> list[int]:
-        """Resolve negative layer indices and validate range."""
-        resolved = []
-        for l in layers:
-            r = l if l >= 0 else self.n_layers + l
-            if not (0 <= r < self.n_layers):
-                raise ProbeError(
-                    f"Layer {l} (resolved={r}) out of range for model "
-                    f"with {self.n_layers} layers."
-                )
-            resolved.append(r)
-        return sorted(set(resolved))
-
-    @torch.no_grad()
-    def _forward(
+    def steer(
         self,
-        texts: list[str],
-        pooling: str,
-        centered: bool,
-    ) -> list[ProbeResult]:
-        """
-        Run a forward pass and extract hidden states.
+        input_text: str,
+        direction: np.ndarray,
+        alpha: float,
+        layers: Optional[list[int]] = None,
+        mode: str = "add",
+    ) -> dict[int, np.ndarray]:
+        """Apply a steering vector and return steered activations."""
+        layers = layers if layers is not None else self.layers
+        return self._backend.steer(input_text, direction=direction, alpha=alpha, layers=layers, mode=mode)
 
-        This uses model.__call__() with output_hidden_states=True.
-        There is no generate() call and no token sampling path.
-        """
-        if not texts:
-            raise ProbeError("Empty input list.")
+    def steer_batch(
+        self,
+        inputs: list[str],
+        direction: np.ndarray,
+        alpha: float,
+        layers: Optional[list[int]] = None,
+        mode: str = "add",
+    ) -> list[dict[int, np.ndarray]]:
+        """Apply steering to a batch of inputs."""
+        layers = layers if layers is not None else self.layers
+        return self._backend.steer_batch(inputs, direction=direction, alpha=alpha, layers=layers, mode=mode)
 
-        t0 = time.time()
+    def save_direction(self, name: str, vector: np.ndarray) -> None:
+        """Save a named steering direction to the in-memory library."""
+        self._backend.save_direction(name, vector)
 
-        # Tokenise (pad to same length for batching).
-        enc = self._tokenizer(
-            texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=2048,
-            add_special_tokens=True,
-        )
-        input_ids      = enc["input_ids"].to(self.device)
-        attention_mask = enc["attention_mask"].to(self.device)
+    def load_direction(self, name: str) -> np.ndarray:
+        """Load a named steering direction from the library."""
+        return self._backend.load_direction(name)
 
-        if input_ids.shape[1] == 0:
-            raise ProbeError("Tokenisation produced empty sequence.")
-
-        # Forward pass — hidden states only, no generation.
-        outputs = self._model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-        )
-
-        # hidden_states: tuple of (n_layers+1) tensors, each [batch, seq, dim]
-        # Index 0 is the embedding layer; index k is layer k-1's output.
-        hs = outputs.hidden_states  # tuple[(batch, seq, dim), ...]
-        if hs is None:
-            raise ProbeError("Model did not return hidden_states.")
-
-        elapsed = time.time() - t0
-        n_tokens = input_ids.shape[1]
-
-        results: list[ProbeResult] = []
-        for batch_idx in range(len(texts)):
-            seq_mask = attention_mask[batch_idx].bool()  # [seq]
-            activations: dict[int, np.ndarray] = {}
-
-            for layer_idx in self.layers:
-                # hs has n_layers+1 entries (embedding + each layer).
-                # Layer k's output is at hs[k+1].
-                h = hs[layer_idx + 1][batch_idx]   # [seq, hidden_dim]
-                h = h[seq_mask]                     # strip padding
-
-                if centered:
-                    h = h - h.mean(dim=0, keepdim=True)
-
-                if pooling == "last_token":
-                    vec = h[-1]
-                elif pooling == "mean":
-                    vec = h.mean(dim=0)
-                else:
-                    raise ProbeError(f"Unknown pooling: '{pooling}'. Use 'last_token' or 'mean'.")
-
-                arr = vec.float().cpu().numpy()
-                activations[layer_idx] = arr
-                log.debug(
-                    "layer=%d shape=%s norm=%.3f",
-                    layer_idx, arr.shape, float(np.linalg.norm(arr)),
-                )
-
-            results.append(ProbeResult(
-                activations=activations,
-                input_tokens=int(seq_mask.sum().item()),
-                elapsed_s=round(elapsed / len(texts), 4),
-            ))
-
-        log.info(
-            "probe: %d inputs, layers=%s, pooling=%s, %.3fs",
-            len(texts), self.layers, pooling, elapsed,
-        )
-        return results
+    def list_directions(self) -> list[str]:
+        """Return the names of all saved steering directions."""
+        return self._backend.list_directions()
 
     def __repr__(self) -> str:
         return (
@@ -315,27 +172,20 @@ class LatentProbe:
             f"layers={self.layers}, device={self.device!r})"
         )
 
+    # ── Legacy shim: probe_batch with layers override ─────────────────────────
+    # Old callers passed layers as a keyword to probe_batch; keep working.
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+    def _forward(self, texts, pooling, centered):
+        """Internal forward — delegates to backend. Legacy callers only."""
+        return [
+            ProbeResult(
+                activations=acts,
+                input_tokens=0,
+                elapsed_s=0.0,
+            )
+            for acts in self._backend.probe_batch(
+                texts, layers=self.layers, pooling=pooling, centered=centered
+            )
+        ]
 
-def _count_layers(model) -> int:
-    """
-    Count transformer blocks robustly across Qwen3/Qwen3.5/DeepSeek architectures.
-    """
-    # Standard: model.model.layers (Qwen3, Llama, Mistral, DeepSeek)
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        return len(model.model.layers)
-    # GPT-style: model.transformer.h
-    if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-        return len(model.transformer.h)
-    # Fallback: count from config
-    cfg = getattr(model, "config", None)
-    if cfg is not None:
-        for attr in ("num_hidden_layers", "n_layer", "num_layers"):
-            v = getattr(cfg, attr, None)
-            if v is not None:
-                return int(v)
-    raise ProbeError(
-        "Cannot determine layer count for this model. "
-        "Check model.model.layers or model.config.num_hidden_layers."
-    )
+

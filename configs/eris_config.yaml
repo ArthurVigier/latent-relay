@@ -40,6 +40,28 @@ generation:
   temperature: 0.7
   top_p: 0.95
 
+# ── Backend selection (used by eris/factory.py) ──────────────────────────────
+backends:
+  orchestrator:
+    backend: "claude"
+    model: "claude-sonnet-4-6"
+    max_tokens: 2048
+    # api_key: null   # reads ANTHROPIC_API_KEY from environment if not set
+
+  probe:
+    backend: "hf"
+    model_id: "Qwen/Qwen3-14B"   # or "Qwen/Qwen3-32B", "deepseek-ai/DeepSeek-V2-Lite"
+    layers: [9, 18]
+    device: "cuda:0"
+    dtype: "bfloat16"            # "bfloat16" | "float32" | "float16"
+
+# ── Multi-agent coordination (used by eris/factory.py create_coordinator) ────
+multi_agent:
+  mode: "isolated"               # "isolated" | "shared_medium" | "collaborative"
+  n_agents: 2
+  checkpoint_every: 3
+  voting_strategy: "majority"    # "majority" | "leader" | "consensus" (collaborative only)
+
 # ── HTTP server ──────────────────────────────────────────────────────────────
 server:
   host: "0.0.0.0"
