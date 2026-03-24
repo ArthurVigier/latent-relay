@@ -21,6 +21,9 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+      - name: Locate ghost file
+        run: find . -name "*transformers-stream-generator*"
+
       - name: Run security gate
         # On scanne AVANT l'installation pour éviter les fichiers temporaires de pip
         run: |
