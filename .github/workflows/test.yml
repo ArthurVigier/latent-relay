@@ -4,7 +4,7 @@ on:
   push:
     branches: ["main"]
   pull_request:
-    branches: ["main"]
+    branches:["main"]
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -21,8 +21,18 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+      - name: Clean up obsolete artifacts
+        # On supprime ce vieux fichier qui fait planter le scanner (s'il est présent)
+        run: rm -f transformers-stream-generator-0.0.5.tar.gz
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Install RTK (Token Optimizer)
+        # On installe RTK ici, avant les tests et le scan
+        run: cargo install --git https://github.com/rtk-ai/rtk --quiet
+        env:
+          CARGO_NET_RETRY: "3"
 
       - name: Run security gate
         run: |
