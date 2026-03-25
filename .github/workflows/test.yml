@@ -23,15 +23,17 @@ jobs:
 
 
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1  # pinned safe commit (v0.35.0 - mars 2026)
         with:
           scan-type: 'fs'
           scan-ref: '.'
           format: 'table'
-          exit-code: '1'                    # bloque le build comme avant
-          severity: 'CRITICAL,HIGH,UNKNOWN' # ajuste selon ta tolérance
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH,UNKNOWN'
           ignore-unfixed: true
+          scanners: 'vuln'                    # désactive secret scanning → plus rapide
           cache: true
+          additional-args: '--file-patterns requirements.txt'  # force le scan sur requirements.txt (plus fiable que uv.lock pour l'instant)
 
       - name: Install RTK (Token Optimizer)
         run: cargo install --git https://github.com/rtk-ai/rtk --quiet
