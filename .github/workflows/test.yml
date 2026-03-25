@@ -21,19 +21,20 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+      - name: Force Purge Corrupted Cache
+        run: |
+          pip cache purge
+          rm -rf ~/.cache/pip
+          find . -name "*.tar.gz" -type f -delete
 
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1  # pinned safe commit (v0.35.0)
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          format: 'table'
-          exit-code: '1'
-          severity: 'CRITICAL,HIGH,UNKNOWN'
-          ignore-unfixed: true
-          scanners: 'vuln'
-          cache: true
-          additional-args: '--file-patterns requirements.txt'   # ← c'est ça qui compte
+
+      - name: Run security gate
+        # On scanne AVANT l'installation pour éviter les fichiers temporaires de pip
+        run: |
+          cargo install --git https://github.com/Krigsexe/ai-rsk --quiet
+          ai-rsk scan
+        env:
+          CARGO_NET_RETRY: "3"
 
       - name: Install RTK (Token Optimizer)
         run: cargo install --git https://github.com/rtk-ai/rtk --quiet
