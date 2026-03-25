@@ -22,16 +22,13 @@ jobs:
           cache: "pip"
 
 
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          format: 'table'
-          exit-code: '1'                    # bloque le build comme avant
-          severity: 'CRITICAL,HIGH,UNKNOWN' # ajuste selon ta tolérance
-          ignore-unfixed: true
-          cache: true
+      - name: Run security gate
+        # On scanne AVANT l'installation pour éviter les fichiers temporaires de pip
+        run: |
+          cargo install --git https://github.com/Krigsexe/ai-rsk --quiet
+          ai-rsk scan
+        env:
+          CARGO_NET_RETRY: "3"
 
       - name: Install RTK (Token Optimizer)
         run: cargo install --git https://github.com/rtk-ai/rtk --quiet
