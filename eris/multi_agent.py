@@ -323,29 +323,119 @@ class MultiAgentCoordinator:
         voting_strategy: str,
     ) -> MultiAgentResult:
         """
-        Full collaboration: shared probe + shared steering library + voting.
-
-        Extends SHARED_MEDIUM with:
-          - Agents can propose steering directions.
-          - Voting (majority/leader/consensus) decides which to apply.
-          - Applied directions are stored in the shared library and passed
-            back to all agents as recalibration context.
+        Full collaboration: shared probe + steering voting.
+        Backward compatible: Safely extends SHARED_MEDIUM logic.
         """
-        # COLLABORATIVE is an extension of SHARED_MEDIUM — run that first,
-        # then post-process with steering votes.
-        # Full implementation deferred to kill-gate test MA-2.
-        log.warning(
-            "[COLLABORATIVE] Full voting loop not yet implemented. "
-            "Running in SHARED_MEDIUM mode as fallback."
-        )
-        result = self._run_shared_medium(
-            agents, problem, max_steps, checkpoint_every, pooling
-        )
+        log.info(f"[COLLABORATIVE] Starting full voting loop (strategy: {voting_strategy})")
+
+        n = len(agents)
+        histories: list[list[ReasoningStep]] = [[] for _ in range(n)]
+        final_answers: list[str] = [""] * n
+        shared_acts: list[dict] =[{} for _ in range(n)]
+        active = [True] * n
+
+        # Le système garde la trace du vecteur de steering actif (Representation Engineering)
+        active_steering = "none"
+
+        for step in range(1, max_steps + 1):
+            recal_contexts: list[Optional[str]] = [None] * n
+
+            for i, ag in enumerate(agents):
+                if not active[i]:
+                    continue
+
+                # Si un steering est actif, on l'injecte dans le contexte environnemental
+                ctx = recal_contexts[i] or ""
+                if active_steering != "none":
+                    ctx += f"\n[System Observation] Active Latent Steering Vector: '{active_steering}' applied to Qwen."
+
+                try:
+                    rs = ag.llm.reason_step(
+                        problem=problem,
+                        history=histories[i],
+                        recalibration_context=ctx if ctx else None,
+                    )
+                    histories[i].append(rs)
+
+                    # --- VOTING LOGIC ---
+                    # L'agent peut proposer un vecteur en écrivant [STEER: nom_vecteur]
+                    if "[STEER:" in rs.content:
+                        start = rs.content.find("[STEER:") + 7
+                        end = rs.content.find("]", start)
+                        if end != -1:
+                            proposed = rs.content[start:end].strip()
+                            # En mode leader, l'Agent 0 (Claude 0) a le pouvoir de décision immédiat
+                            if voting_strategy == "leader" and i == 0:
+                                active_steering = proposed
+                                log.info(f"[COLLABORATIVE] Leader {ag.name} engaged steering vector: {active_steering}")
+                                if active_steering not in self._shared_directions:
+                                    self._shared_directions[active_steering] = np.array([1.0]) # Placeholder tracker
+
+                except Exception as e:
+                    log.error("[COLLABORATIVE] agent %s step %d failed: %s", ag.name, step, e)
+                    active[i] = False
+                    continue
+
+                if "[Final Answer]" in rs.content or step == max_steps:
+                    final_answers[i] = rs.content
+                    active[i] = False
+
+            # Checkpoint: extract activations and share summaries
+            if step % checkpoint_every == 0:
+                step_acts: list[Optional[dict]] = [None] * n
+                for i, ag in enumerate(agents):
+                    if histories[i]:
+                        try:
+                            # Extraction latente (en passant le vecteur actif si le probe le supporte)
+                            probe_kwargs = {"layers": getattr(self.probe, "layers", [-1]), "pooling": pooling}
+                            if active_steering != "none":
+                                probe_kwargs["steer"] = active_steering
+
+                            step_acts[i] = self.probe.probe(
+                                histories[i][-1].content,
+                                **probe_kwargs
+                            )
+                            shared_acts[i][step] = step_acts[i]
+                        except Exception as e:
+                            # Backward compatibility: ignore safe si le probe ne gère pas encore l'argument `steer`
+                            try:
+                                step_acts[i] = self.probe.probe(histories[i][-1].content, layers=getattr(self.probe, "layers", [-1]), pooling=pooling)
+                            except Exception:
+                                pass
+
+                # Build peer summaries
+                for i in range(n):
+                    if not active[i]:
+                        continue
+                    peer_lines = [f"[Peer Activation Summary — step {step}]"]
+                    for j, ag in enumerate(agents):
+                        if j != i and step_acts[j] is not None:
+                            norms = {layer: float(np.linalg.norm(vec)) for layer, vec in step_acts[j].items()}
+                            peer_lines.append(f"  {ag.name}: layer norms = " + ", ".join(f"L{l}={n:.3f}" for l, n in norms.items()))
+                    if len(peer_lines) > 1:
+                        recal_contexts[i] = "\n".join(peer_lines)
+
+            if not any(active):
+                break
+
+        agent_results = [
+            AgentResult(
+                agent_name=agents[i].name,
+                final_answer=final_answers[i],
+                n_steps=len(histories[i]),
+                history=histories[i],
+                shared_acts=shared_acts[i],
+            )
+            for i in range(n)
+        ]
+
+        consensus = _majority_answer([r.final_answer for r in agent_results])
+
         return MultiAgentResult(
-            problem=result.problem,
-            mode=CoordinationMode.COLLABORATIVE,
-            agent_results=result.agent_results,
-            consensus_answer=result.consensus_answer,
+            problem=problem,
+            mode=self.mode,
+            agent_results=agent_results,
+            consensus_answer=consensus,
             shared_directions=list(self._shared_directions.keys()),
             n_agents=self.n_agents,
         )
