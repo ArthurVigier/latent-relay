@@ -143,11 +143,25 @@ class ClaudeOrchestrator(OrchestratorLLM):
         history: list[ReasoningStep],
         recalibration_context: Optional[str],
     ) -> list[dict]:
-        messages: list[dict] = [{"role": "user", "content": problem}]
+        messages: list[dict] =[{"role": "user", "content": problem}]
+
         for step in history:
             messages.append({"role": "assistant", "content": step.content})
+
         if recalibration_context:
-            messages.append({"role": "user", "content": recalibration_context})
+            # Approche Canonique : Le coordinateur injecte l'observation de l'espace latent.
+            messages.append({
+                "role": "user",
+                "content": f"[System Observation - Latent Environment]\n{recalibration_context}"
+            })
+        elif len(history) > 0:
+            # Si on est dans une boucle (Etape > 1) sans observation,
+            # il FAUT relancer Claude avec un prompt user pour éviter l'erreur 400.
+            messages.append({
+                "role": "user",
+                "content": "Please continue your reasoning step by step. If you are done, conclude with[Final Answer]."
+            })
+
         return messages
 
     def _call(
