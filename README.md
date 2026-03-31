@@ -302,6 +302,7 @@ outputs = probe.probe("Prove there are infinitely many primes.", top_k=20)
 # outputs: dict[int, ProbeOutput]
 # outputs[20].active_feature_indices  → list of feature indices
 # outputs[20].active_feature_values   → corresponding activation values
+# outputs[20].active_feature_labels   → concept labels when labels_path is provided
 # outputs[20].n_active               → number of active features
 ```
 
@@ -471,17 +472,19 @@ The ERIS server exposes an MCP endpoint at `/mcp` (Server-Sent Events transport)
 {
   "text": "Prove that sqrt(2) is irrational.",
   "layers": [10, 20, 30],
-  "top_k": 20
+  "top_k": 20,
+  "labels_path": "configs/feature_labels.json"
 }
 ```
 
 Response:
 ```json
 {
-  "results": {
+  "layers": {
     "10": {
       "active_feature_indices": [412, 883, 2041, ...],
       "active_feature_values": [1.23, 0.87, 0.44, ...],
+      "active_feature_labels": ["proof_state", "number_theory", null, ...],
       "n_active": 47,
       "n_all_active": 312
     }
@@ -583,7 +586,7 @@ Qwen3-14B M4 (`results/phase1_qwen3-14b_20260322_162358.json`): Spearman=0.415, 
 
 Trained on 2,000 hidden states (layer 9, last-token pool). Mean implicit features active per question: **20.0**. Mean surface features: **0.0**. Every activated SAE feature is latent-only, absent from the output text.
 
-Feature labels are `null` (auto-labelling not yet run). To label:
+Feature labels may be `null` until auto-labelling or a custom labels JSON is provided. To label:
 
 ```bash
 ANTHROPIC_API_KEY=... python eval/train_sae.py --layer 9 --auto-label
