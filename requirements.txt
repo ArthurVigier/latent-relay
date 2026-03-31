@@ -12,7 +12,7 @@ pydantic>=2.7.0
 mcp>=1.23.0
 
 # Test client
-requests>=2.32.4
+requests>=2.33.0
 
 # Probe loading
 joblib>=1.4.3
