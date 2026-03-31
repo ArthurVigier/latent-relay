@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -52,6 +54,19 @@ _VALID_WIDTHS = {"16k", "64k", "256k", "1m"}
 _VALID_L0     = {"small", "medium", "big"}
 
 
+def serialize_probe_outputs(probe_out: dict[int, "ProbeOutput"]) -> dict[str, dict[str, object]]:
+    return {
+        str(layer_idx): {
+            "active_feature_indices": out.active_feature_indices,
+            "active_feature_values": out.active_feature_values,
+            "active_feature_labels": out.active_feature_labels,
+            "n_active": out.n_active,
+            "n_all_active": len(out.all_active_indices),
+        }
+        for layer_idx, out in probe_out.items()
+    }
+
+
 @dataclass
 class ProbeOutput:
     """
@@ -61,6 +76,7 @@ class ProbeOutput:
         layer:                  Index de la couche sondée.
         active_feature_indices: Indices des features actives (top-K).
         active_feature_values:  Valeurs correspondantes (ordre décroissant).
+        active_feature_labels:  Labels des features top-K si disponibles.
         all_active_indices:     Tous les indices actifs (non limités à top-K).
         n_active:               Nombre total de features actives.
         raw_activations:        Activations brutes [hidden_dim] — pour DriftDetector.
@@ -73,6 +89,7 @@ class ProbeOutput:
     n_active:               int
     raw_activations:        np.ndarray
     elapsed_s:              float
+    active_feature_labels:  list[Optional[str]] = field(default_factory=list)
 
 
 class SAEProbe:
@@ -99,6 +116,7 @@ class SAEProbe:
         sae_width: str = "16k",
         l0: str = "medium",
         device: str = "cuda",
+        labels_path: Optional[str] = None,
     ) -> None:
         if sae_width not in _VALID_WIDTHS:
             raise ValueError(f"sae_width doit être dans {_VALID_WIDTHS}, reçu: {sae_width!r}")
@@ -110,6 +128,7 @@ class SAEProbe:
         self.sae_width = sae_width
         self.l0        = l0
         self.device    = device if torch.cuda.is_available() else "cpu"
+        self.labels_path = labels_path
 
         # Résoudre le release ID
         short_id = model_id.split("/")[-1]
@@ -121,6 +140,7 @@ class SAEProbe:
                 "Pour ajouter un nouveau modèle, appelle SAEProbe.list_available_releases()."
             )
         self._release = release
+        self._labels = self._load_labels(labels_path)
 
         log.info("Chargement du modèle : %s sur %s", model_id, self.device)
         t0 = time.time()
@@ -192,32 +212,16 @@ class SAEProbe:
             # acts : [1, hidden_dim] → sae.encode → [1, n_features]
             features = sae.encode(acts)[0]  # [n_features]
 
-            active_mask    = features > 0
-            all_active_idx = active_mask.nonzero(as_tuple=True)[0].tolist()
-            n_active       = len(all_active_idx)
-
-            # Top-K pour le résumé (limité si moins de k features actives)
-            k = min(top_k, n_active)
-            if k > 0:
-                topk = features.topk(k)
-                top_indices = topk.indices.tolist()
-                top_values  = [round(float(v), 4) for v in topk.values.tolist()]
-            else:
-                top_indices = []
-                top_values  = []
-
-            results[layer_idx] = ProbeOutput(
-                layer=layer_idx,
-                active_feature_indices=top_indices,
-                active_feature_values=top_values,
-                all_active_indices=all_active_idx,
-                n_active=n_active,
+            results[layer_idx] = self._build_probe_output(
+                layer_idx=layer_idx,
                 raw_activations=acts.squeeze(0).float().cpu().numpy(),
-                elapsed_s=round(elapsed, 4),
+                features=features.float().cpu().numpy(),
+                elapsed=elapsed,
+                top_k=top_k,
             )
             log.debug(
                 "layer=%d n_active=%d top5=%s",
-                layer_idx, n_active, top_indices[:5],
+                layer_idx, results[layer_idx].n_active, results[layer_idx].active_feature_indices[:5],
             )
 
         log.info(
@@ -262,6 +266,66 @@ class SAEProbe:
             print("Vérifie sur : https://jbloomaus.github.io/SAELens/sae_table/")
 
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _load_labels(self, labels_path: Optional[str]) -> dict[Optional[int], dict[int, str]]:
+        if not labels_path:
+            return {}
+        path = Path(labels_path)
+        if not path.exists():
+            raise FileNotFoundError(f"labels_path introuvable: {labels_path}")
+
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        labels: dict[Optional[int], dict[int, str]] = {}
+        for key, value in raw.items():
+            if isinstance(value, str):
+                labels.setdefault(None, {})[int(key)] = value
+            elif isinstance(value, dict):
+                labels[int(key)] = {int(idx): str(label) for idx, label in value.items()}
+            else:
+                raise ValueError(
+                    "Format labels invalide: attendu {feature_idx: label} ou {layer: {feature_idx: label}}"
+                )
+        return labels
+
+    def labels_for_indices(self, layer_idx: int, indices: list[int]) -> list[Optional[str]]:
+        global_labels = self._labels.get(None, {}) if getattr(self, "_labels", None) else {}
+        layer_labels = self._labels.get(layer_idx, {}) if getattr(self, "_labels", None) else {}
+        return [layer_labels.get(idx, global_labels.get(idx)) for idx in indices]
+
+    def _build_probe_output(
+        self,
+        *,
+        layer_idx: int,
+        raw_activations: np.ndarray,
+        features: np.ndarray,
+        elapsed: float,
+        top_k: int,
+    ) -> ProbeOutput:
+        active_mask = features > 0
+        all_active_idx = np.flatnonzero(active_mask).tolist()
+        n_active = len(all_active_idx)
+
+        k = min(top_k, n_active)
+        if k > 0:
+            top_indices_np = np.argsort(features)[-k:][::-1]
+            top_indices = top_indices_np.tolist()
+            top_values = [round(float(features[idx]), 4) for idx in top_indices]
+            top_labels = self.labels_for_indices(layer_idx, top_indices)
+        else:
+            top_indices = []
+            top_values = []
+            top_labels = []
+
+        return ProbeOutput(
+            layer=layer_idx,
+            active_feature_indices=top_indices,
+            active_feature_values=top_values,
+            active_feature_labels=top_labels,
+            all_active_indices=all_active_idx,
+            n_active=n_active,
+            raw_activations=raw_activations.astype(np.float32),
+            elapsed_s=round(elapsed, 4),
+        )
 
     def _load_model(self):
         from transformers import AutoModelForCausalLM, AutoTokenizer

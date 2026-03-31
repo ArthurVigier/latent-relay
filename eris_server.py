@@ -686,6 +686,7 @@ class SAEProbeRequest(BaseModel):
     l0:         str   = Field("medium", description="Sparsité SAE : small, medium, big.")
     top_k:      int   = Field(20, ge=1, le=500, description="Features top-K retournées.")
     device:     str   = Field("cuda",   description="Device torch.")
+    labels_path: Optional[str] = Field(None, description="Chemin optionnel vers un JSON de labels de features.")
 
 
 class SAEProbeResponse(BaseModel):
@@ -735,18 +736,20 @@ async def v1_sae_probe(req: SAEProbeRequest):
                 _sae_probe.model_id   != req.model_id
                 or _sae_probe.sae_width != req.sae_width
                 or _sae_probe.l0        != req.l0
+                or getattr(_sae_probe, "labels_path", None) != req.labels_path
             ):
                 _eris_log.info(
                     "Chargement SAEProbe: model=%s sae=%s/l0_%s layers=%s",
                     req.model_id, req.sae_width, req.l0, req.layers,
                 )
-                from eris.sae_probe import SAEProbe
+                from eris.sae_probe import SAEProbe, serialize_probe_outputs
                 _sae_probe = SAEProbe(
                     model_id=req.model_id,
                     layers=req.layers,
                     sae_width=req.sae_width,
                     l0=req.l0,
                     device=req.device,
+                    labels_path=req.labels_path,
                 )
 
         # Probe
@@ -755,14 +758,8 @@ async def v1_sae_probe(req: SAEProbeRequest):
         elapsed   = round(time.time() - t0, 4)
 
         # Sérialiser
-        layers_resp: dict[str, Any] = {}
-        for layer_idx, out in probe_out.items():
-            layers_resp[str(layer_idx)] = {
-                "active_feature_indices": out.active_feature_indices,
-                "active_feature_values":  out.active_feature_values,
-                "n_active":               out.n_active,
-                "n_all_active":           len(out.all_active_indices),
-            }
+        from eris.sae_probe import serialize_probe_outputs
+        layers_resp: dict[str, Any] = serialize_probe_outputs(probe_out)
 
         # Compter les tokens via le tokenizer du SAEProbe
         n_tokens = len(_sae_probe._tokenizer(req.text)["input_ids"])
