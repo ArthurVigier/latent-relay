@@ -23,6 +23,7 @@ from eris.interfaces import (
     RecalibrationNote,
     ReasoningStep,
 )
+from eris.backends.orchestrators.common import build_interpretation_prompt
 
 log = logging.getLogger("eris.claude_orchestrator")
 
@@ -102,19 +103,10 @@ class ClaudeOrchestrator(OrchestratorLLM):
         drift_report: DriftReport,
         problem_context: str,
     ) -> RecalibrationNote:
-        layers = getattr(drift_report, "layers_ranked", getattr(drift_report, "layers_affected", []))
-        comparison_mode = getattr(drift_report, "comparison_mode", "reference")
-        severity = getattr(drift_report, "severity", "unknown")
-        prompt = (
-            f"Problem context (last 2000 chars):\n{problem_context[-2000:]}\n\n"
-            f"Drift score: {drift_report.drift_score:.4f} "
-            f"(threshold: {drift_report.threshold:.4f})\n"
-            f"Layers most affected: {layers[:3]}\n"
-            f"Comparison mode: {comparison_mode}\n"
-            f"Severity: {severity}\n\n"
-            f"Activation geometry observation:\n{activations_description}\n\n"
-            "Produce a brief recalibration note (2-4 sentences). "
-            "Focus on what this suggests about the current reasoning trajectory."
+        prompt = build_interpretation_prompt(
+            problem_context=problem_context,
+            activations_description=activations_description,
+            drift_report=drift_report,
         )
         messages = [{"role": "user", "content": prompt}]
         text = self._call(messages, system=_SYSTEM_INTERPRET)
