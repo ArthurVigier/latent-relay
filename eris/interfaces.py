@@ -47,8 +47,8 @@ class DriftReport:
     """
     Output of a single DriftDetector.compute_drift() call.
 
-    This is the canonical DriftReport used throughout ERIS.
-    eris/drift_detector.py imports this class directly.
+    This V1 dataclass remains valid for older backends while exposing a small
+    compatibility surface for V2 SAE-based callers.
     """
     step:                 int
     drift_score:          float   # smoothed, [0, 1]
@@ -59,6 +59,66 @@ class DriftReport:
     layers_affected:      list[int]   # ranked highest drift first
     should_consult_probe: bool
     threshold:            float
+
+    @property
+    def layers_ranked(self) -> list[int]:
+        return list(self.layers_affected)
+
+    @property
+    def comparison_mode(self) -> str:
+        return "reference"
+
+    @property
+    def severity(self) -> str:
+        score = self.drift_score
+        if score < 0.10:
+            return "stable"
+        if score < 0.35:
+            return "low"
+        if score < 0.80:
+            return "medium"
+        return "high"
+
+    @property
+    def layer_scores(self) -> dict[int, float]:
+        return {}
+
+    @property
+    def features_lost(self) -> dict[int, list[int]]:
+        return {}
+
+    @property
+    def features_gained(self) -> dict[int, list[int]]:
+        return {}
+
+    @property
+    def n_active_per_layer(self) -> dict[int, int]:
+        return {}
+
+    @property
+    def n_layers_evaluated(self) -> int:
+        return len(self.layers_affected)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "step": self.step,
+            "drift_score": self.drift_score,
+            "raw_drift_score": self.raw_drift_score,
+            "cosine_distances": self.cosine_distances,
+            "l2_distances": self.l2_distances,
+            "llc_scores": self.llc_scores,
+            "layers_affected": self.layers_affected,
+            "layers_ranked": self.layers_ranked,
+            "should_consult_probe": self.should_consult_probe,
+            "threshold": self.threshold,
+            "comparison_mode": self.comparison_mode,
+            "severity": self.severity,
+            "layer_scores": self.layer_scores,
+            "features_lost": self.features_lost,
+            "features_gained": self.features_gained,
+            "n_active_per_layer": self.n_active_per_layer,
+            "n_layers_evaluated": self.n_layers_evaluated,
+        }
 
 
 # ── OrchestratorLLM ───────────────────────────────────────────────────────────

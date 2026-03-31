@@ -246,22 +246,27 @@ class ERISOrchestrator:
         pas de nombres bruts d'activations. À terme, les indices
         peuvent être liés aux labels Neuronpedia pour plus de sémantique.
         """
+        ranked_layers = report.layers_ranked or sorted(report.features_lost.keys())
         lines = [
-            f"Drift score global : {report.drift_score:.3f} "
-            f"(seuil : {report.threshold})",
+            f"Drift score global : {report.drift_score:.3f} (seuil : {report.threshold})",
+            f"Severity : {getattr(report, 'severity', 'unknown')}",
+            f"Comparison mode : {getattr(report, 'comparison_mode', 'reference')}",
+            f"Top drifting layers : {ranked_layers[:3]}",
             "",
             "Par couche :",
         ]
 
-        for layer in sorted(report.features_lost.keys()):
-            lost    = report.features_lost.get(layer, [])
-            gained  = report.features_gained.get(layer, [])
-            n_act   = report.n_active_per_layer.get(layer, 0)
-            cos     = report.cosine_distances.get(layer, 0.0)
-            jacc    = report.jaccard_distances.get(layer, 0.0)
+        for layer in ranked_layers:
+            lost = report.features_lost.get(layer, [])
+            gained = report.features_gained.get(layer, [])
+            n_act = report.n_active_per_layer.get(layer, 0)
+            cos = report.cosine_distances.get(layer, 0.0)
+            jacc = report.jaccard_distances.get(layer, 0.0)
+            layer_score = getattr(report, "layer_scores", {}).get(layer)
+            score_text = f"score={layer_score:.3f} | " if layer_score is not None else ""
 
             lines.append(
-                f"  Couche {layer} : {n_act} features actives | "
+                f"  Couche {layer} : {score_text}{n_act} features actives | "
                 f"cosine={cos:.3f} | jaccard={jacc:.3f}"
             )
             if lost[:8]:
