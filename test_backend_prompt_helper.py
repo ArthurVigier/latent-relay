@@ -15,6 +15,9 @@ def test_build_interpretation_prompt_supports_v2_report_fields():
         comparison_mode="previous",
         severity="medium",
         layers_ranked=[20, 10],
+        feature_labels={20: {1: "proof_state", 9: "modular_reasoning"}},
+        features_lost={20: [1]},
+        features_gained={20: [9]},
     )
 
     prompt = build_interpretation_prompt(
@@ -27,6 +30,9 @@ def test_build_interpretation_prompt_supports_v2_report_fields():
     assert "Layers most affected: [20, 10]" in prompt
     assert "Comparison mode: previous" in prompt
     assert "Severity: medium" in prompt
+    assert "Named concepts in drift" in prompt
+    assert "20:1:proof_state" in prompt
+    assert "20:9:modular_reasoning" in prompt
     assert "Activation geometry observation:\nobservation" in prompt
 
 
