@@ -73,6 +73,8 @@ class ConsultationRecord:
     drift_score:         float
     n_features_lost:     dict[int, int]   # {layer: count}
     n_features_gained:   dict[int, int]   # {layer: count}
+    lost_concepts:       list[str]
+    gained_concepts:     list[str]
     observation_text:    str              # envoyé à Claude
     response_preview:    str              # 200 premiers chars de la réponse Claude
     elapsed_s:           float
@@ -213,6 +215,14 @@ class ERISOrchestrator:
                         n_features_gained={
                             k: len(v) for k, v in report.features_gained.items()
                         },
+                        lost_concepts=self._extract_labeled_concepts(
+                            report.features_lost,
+                            getattr(report, "feature_labels", {}),
+                        ),
+                        gained_concepts=self._extract_labeled_concepts(
+                            report.features_gained,
+                            getattr(report, "feature_labels", {}),
+                        ),
                         observation_text=drift_desc,
                         response_preview="",    # rempli à la prochaine itération
                         elapsed_s=round(time.time() - ct0, 3),
@@ -287,4 +297,18 @@ class ERISOrchestrator:
         for idx in indices:
             label = label_map.get(idx)
             refs.append(f"{idx}:{label}" if label else str(idx))
+        return refs
+
+    @staticmethod
+    def _extract_labeled_concepts(
+        features: dict[int, list[int]],
+        feature_labels: dict[int, dict[int, str | None]],
+    ) -> list[str]:
+        refs: list[str] = []
+        for layer, indices in features.items():
+            label_map = feature_labels.get(layer, {})
+            for idx in indices:
+                label = label_map.get(idx)
+                if label:
+                    refs.append(f"{layer}:{idx}:{label}")
         return refs

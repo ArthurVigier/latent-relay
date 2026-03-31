@@ -18,6 +18,7 @@ def _make_v2_report() -> V2DriftReport:
         severity="medium",
         layer_scores={20: 0.8, 10: 0.3},
         layers_ranked=[20, 10],
+        feature_labels={20: {1: "proof_state", 9: "modular_reasoning"}},
         features_lost={20: [1, 2], 10: [3]},
         features_gained={20: [9], 10: [8]},
     )
@@ -59,6 +60,8 @@ def test_claude_interpret_activations_uses_unified_v2_fields():
     assert "Layers most affected: [20, 10]" in prompt
     assert "Comparison mode: previous" in prompt
     assert "Severity: medium" in prompt
+    assert "proof_state" in prompt
+    assert "modular_reasoning" in prompt
 
 
 def test_gemini_interpret_activations_works_with_v1_compat_fields():
@@ -85,3 +88,5 @@ def test_openrouter_interpret_activations_uses_unified_fields():
     assert "Layers most affected: [20, 10]" in prompt
     assert "Comparison mode: previous" in prompt
     assert "Severity: medium" in prompt
+    assert "proof_state" in prompt
+    assert "modular_reasoning" in prompt
