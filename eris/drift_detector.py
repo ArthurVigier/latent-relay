@@ -116,6 +116,7 @@ class DriftReport:
     jaccard_distances: dict[int, float] = field(default_factory=dict)
     layer_scores: dict[int, float] = field(default_factory=dict)
     layers_ranked: list[int] = field(default_factory=list)
+    feature_labels: dict[int, dict[int, Optional[str]]] = field(default_factory=dict)
     n_active_per_layer: dict[int, int] = field(default_factory=dict)
     n_layers_evaluated: int = 0
     summary: str = ""
@@ -140,6 +141,7 @@ class DriftReport:
             "layer_scores": self.layer_scores,
             "layers_ranked": self.layers_ranked,
             "layers_affected": self.layers_affected,
+            "feature_labels": self.feature_labels,
             "n_active_per_layer": self.n_active_per_layer,
             "n_layers_evaluated": self.n_layers_evaluated,
             "summary": self.summary,
@@ -239,6 +241,7 @@ class DriftDetector:
         cosine_distances: dict[int, float] = {}
         jaccard_distances: dict[int, float] = {}
         layer_scores: dict[int, float] = {}
+        feature_labels: dict[int, dict[int, Optional[str]]] = {}
         n_active: dict[int, int] = {}
 
         for layer_idx, ref in baseline.items():
@@ -249,6 +252,12 @@ class DriftDetector:
 
             ref_set = set(ref.all_active_indices)
             cur_set = set(cur.all_active_indices)
+            label_map: dict[int, Optional[str]] = {}
+            for idx, label in zip(ref.active_feature_indices, getattr(ref, "active_feature_labels", [])):
+                label_map[idx] = label
+            for idx, label in zip(cur.active_feature_indices, getattr(cur, "active_feature_labels", [])):
+                label_map[idx] = label
+            feature_labels[layer_idx] = label_map
 
             features_lost[layer_idx] = sorted(ref_set - cur_set)
             features_gained[layer_idx] = sorted(cur_set - ref_set)
@@ -292,6 +301,7 @@ class DriftDetector:
             jaccard=jaccard_distances,
             layer_scores=layer_scores,
             layers_ranked=layers_ranked,
+            feature_labels=feature_labels,
             n_active=n_active,
             should_consult=should_consult,
             severity=severity,
@@ -323,6 +333,7 @@ class DriftDetector:
             jaccard_distances=jaccard_distances,
             layer_scores=layer_scores,
             layers_ranked=layers_ranked,
+            feature_labels=feature_labels,
             n_active_per_layer=n_active,
             n_layers_evaluated=len(layer_scores),
             summary=summary,
@@ -346,6 +357,7 @@ class DriftDetector:
         jaccard: dict[int, float],
         layer_scores: dict[int, float],
         layers_ranked: list[int],
+        feature_labels: dict[int, dict[int, Optional[str]]],
         n_active: dict[int, int],
         should_consult: bool,
         severity: str,
@@ -362,8 +374,25 @@ class DriftDetector:
             cos = cosine.get(layer, 0.0)
             jacc = jaccard.get(layer, 0.0)
             layer_score = layer_scores.get(layer, 0.0)
+            label_map = feature_labels.get(layer, {})
             lines.append(
                 f"  Layer {layer}: score={layer_score:.3f} | {n} actives | -{n_lost} perdues | +{n_gained} nouvelles | "
                 f"jaccard={jacc:.3f} | cosine={cos:.3f}"
             )
+            if lost.get(layer):
+                lines.append(
+                    f"    lost={self._format_feature_refs(lost[layer][:8], label_map)}"
+                )
+            if gained.get(layer):
+                lines.append(
+                    f"    gained={self._format_feature_refs(gained[layer][:8], label_map)}"
+                )
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_feature_refs(indices: list[int], label_map: dict[int, Optional[str]]) -> list[str]:
+        refs: list[str] = []
+        for idx in indices:
+            label = label_map.get(idx)
+            refs.append(f"{idx}:{label}" if label else str(idx))
+        return refs

@@ -263,6 +263,7 @@ class ERISOrchestrator:
             cos = report.cosine_distances.get(layer, 0.0)
             jacc = report.jaccard_distances.get(layer, 0.0)
             layer_score = getattr(report, "layer_scores", {}).get(layer)
+            label_map = getattr(report, "feature_labels", {}).get(layer, {})
             score_text = f"score={layer_score:.3f} | " if layer_score is not None else ""
 
             lines.append(
@@ -270,8 +271,20 @@ class ERISOrchestrator:
                 f"cosine={cos:.3f} | jaccard={jacc:.3f}"
             )
             if lost[:8]:
-                lines.append(f"    Features disparues (top 8 indices) : {lost[:8]}")
+                lines.append(
+                    f"    Features disparues (top 8 indices) : {self._format_feature_refs(lost[:8], label_map)}"
+                )
             if gained[:8]:
-                lines.append(f"    Features nouvelles (top 8 indices) : {gained[:8]}")
+                lines.append(
+                    f"    Features nouvelles (top 8 indices) : {self._format_feature_refs(gained[:8], label_map)}"
+                )
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_feature_refs(indices: list[int], label_map: dict[int, str | None]) -> list[str]:
+        refs: list[str] = []
+        for idx in indices:
+            label = label_map.get(idx)
+            refs.append(f"{idx}:{label}" if label else str(idx))
+        return refs
