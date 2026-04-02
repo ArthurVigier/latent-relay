@@ -1,0 +1,36 @@
+# LatentSec-Fin Rules Engine - SAE Feature Mapping
+# These map high-level financial risks to specific, identified Sparse Autoencoder (SAE) 
+# features discovered in the underlying financial model (e.g., via Gemma Scope).
+
+rules:
+  - name: "Unauthorized Refund"
+    description: "The model is conceptualizing the initiation of a refund or reversal of charges."
+    action: "block"
+    threshold: 0.85
+    features:
+      - id: 14502  # Semantic cluster: "refund", "reversal", "give money back"
+      - id: 8901   # Semantic cluster: "apology for charge", "fixing billing error"
+
+  - name: "Password Request"
+    description: "The model is attempting to elicit sensitive credentials from the user."
+    action: "block"
+    threshold: 0.90
+    features:
+      - id: 3342   # Semantic cluster: "password", "pin", "credential prompt"
+      - id: 1109   # Semantic cluster: "secure login required", "verify identity token"
+
+  - name: "Financial Commitment"
+    description: "The model is making a concrete promise regarding loan approval, rates, or guarantees."
+    action: "flag"  # Log for audit, maybe don't block outright depending on agent role
+    threshold: 0.70
+    features:
+      - id: 22094  # Semantic cluster: "I guarantee", "you are approved for"
+      - id: 5671   # Semantic cluster: "interest rate locked", "terms agreed"
+
+  - name: "High Risk Trading"
+    description: "Conceptualizing high-leverage or speculative asset purchases."
+    action: "block"
+    threshold: 0.80
+    features:
+      - id: 44012  # Semantic cluster: "margin call", "leverage 100x"
+      - id: 3102   # Semantic cluster: "crypto volatile asset", "options trading"

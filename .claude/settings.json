@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git push:*)",
+      "Bash(python -m pytest tests/test_bridge.py -q)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:docs.sae-lens.org)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:decoderesearch.github.io)",
+      "WebSearch",
+      "Bash(python -c \":*)",
+      "Bash(python -m pytest test_bridge.py -q)"
+    ]
+  }
+}
